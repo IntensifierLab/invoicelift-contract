@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = [
+    "invoice-registry",
+    "pool-manager",
+    "repayment-waterfall",
+]
+
+[workspace.dependencies]
+soroban-sdk = { version = "20.5.0" }
+
+[workspace.package]
+rust-version = "1.78"
