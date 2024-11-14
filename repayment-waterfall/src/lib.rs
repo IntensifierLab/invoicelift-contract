@@ -38,3 +38,5 @@ impl RepaymentWaterfall {
 // Contribution check by alexdev99 at 2025-12-18T18:53:47
 
 // Contribution check by lisap at 2026-03-25T00:24:49
+
+// Contribution by CelestinaBeing — 2024-11-14
