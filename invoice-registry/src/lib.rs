@@ -40,3 +40,5 @@ impl InvoiceRegistry {
 // Contribution check by johndoedev at 2026-03-18T03:26:53
 
 // Contribution by kulayddon — 2024-11-23
+
+// Contribution by Gbangbolaoluwagbemiga — 2024-12-23
