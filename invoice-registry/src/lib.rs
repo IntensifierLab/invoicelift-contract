@@ -58,3 +58,5 @@ impl InvoiceRegistry {
 // Contribution by kulayddon — 2025-07-17
 
 // Contribution by Gbangbolaoluwagbemiga — 2025-08-15
+
+// Contribution by kulayddon — 2025-09-14
