@@ -6,3 +6,7 @@
 **Acceptance Criteria:**
 - Only authorized parties can approve/verify an invoice.
 - Ownership assignment securely transfers rights to the pool manager.
+
+## Issue: Add concentration and exposure limits in pool-manager
+**Labels:** `core`, `finance`
+**Description:** Ensure that no single pool is over-exposed to a single buyer or SME to maintain healthy risk distribution.
