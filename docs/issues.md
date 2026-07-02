@@ -10,3 +10,7 @@
 ## Issue: Add concentration and exposure limits in pool-manager
 **Labels:** `core`, `finance`
 **Description:** Ensure that no single pool is over-exposed to a single buyer or SME to maintain healthy risk distribution.
+**Acceptance Criteria:**
+- Configurable limits per pool.
+- Rejection of financing requests that breach limits.
+
