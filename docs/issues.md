@@ -14,3 +14,9 @@
 - Configurable limits per pool.
 - Rejection of financing requests that breach limits.
 
+## Issue: Implement repayment-waterfall principal/fee split
+**Labels:** `core`, `finance`
+**Description:** Build the logic in `repayment-waterfall` to correctly route incoming funds to principals, protocol fees, and lenders based on predefined precedence.
+**Acceptance Criteria:**
+- Math precision handles complex splits without rounding errors.
+- Disburses funds immediately upon receipt of buyer repayment.
