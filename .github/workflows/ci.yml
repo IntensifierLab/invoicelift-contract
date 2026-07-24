@@ -17,12 +17,54 @@ jobs:
       - name: Cargo check workspace
         run: cargo check --workspace
 
+  wasm-size:
+    name: WASM size check
   audit:
     name: cargo-audit (dependency scanning)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+      - name: Build contracts (release Wasm)
+        run: cargo build --release --target wasm32-unknown-unknown --workspace
+      - name: Check Wasm size per crate (fail if > 64KB)
+        run: |
+          set -euo pipefail
+          MAX=$((64 * 1024))
+          fail=0
+          mkdir -p wasm-sizes
+          report=wasm-sizes/report.md
+          {
+            echo "# Contract Wasm sizes"
+            echo ""
+            echo "| Contract | Size (bytes) | Limit (bytes) | Status |"
+            echo "| --- | ---: | ---: | --- |"
+          } > "$report"
+          for f in target/wasm32-unknown-unknown/release/*.wasm; do
+            name=$(basename "$f")
+            size=$(stat -c%s "$f")
+            if [ "$size" -gt "$MAX" ]; then
+              status="❌ OVER"
+              fail=1
+            else
+              status="✅ ok"
+            fi
+            echo "$name: $size bytes (limit $MAX) — $status"
+            echo "| \`$name\` | $size | $MAX | $status |" >> "$report"
+          done
+          cat "$report" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::One or more contracts exceed the 64KB Wasm size limit"
+            exit 1
+          fi
+      - name: Upload Wasm size report
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-sizes
+          path: wasm-sizes/report.md
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       # Runs on every push/PR. Suppressed advisories (dev/build-tree only, not
