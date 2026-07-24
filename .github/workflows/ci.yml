@@ -70,6 +70,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       # Runs on every push/PR. Suppressed advisories (dev/build-tree only, not
