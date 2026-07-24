@@ -16,3 +16,17 @@ jobs:
           targets: wasm32-unknown-unknown
       - name: Cargo check workspace
         run: cargo check --workspace
+
+  audit:
+    name: cargo-audit (dependency scanning)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      # Runs on every push/PR. Suppressed advisories (dev/build-tree only, not
+      # reachable from the deployed no_std Wasm) are justified in
+      # .cargo/audit.toml; any new, unlisted advisory fails the job.
+      - name: cargo audit
+        run: cargo audit --deny warnings
