@@ -1,5 +1,99 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, symbol_short, Env, Symbol};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Env, Symbol, Vec};
+
+/// Pedersen constants matching those in the invoice registry.
+const P: i128 = i128::MAX;
+
+#[allow(dead_code)]
+const G: i128 = 5;
+#[allow(dead_code)]
+const H: i128 = 7;
+
+
+/// Helper to reduce a u128 modulo P = 2^127 - 1 using Mersenne prime properties.
+fn reduce_u128(x: u128) -> u128 {
+    const P_U128: u128 = (1 << 127) - 1;
+    let mut val = (x & P_U128) + (x >> 127);
+    if val >= P_U128 {
+        val -= P_U128;
+    }
+    val
+}
+
+/// Modular multiplication safe for i128 and Mersenne prime P = 2^127 - 1.
+fn mod_mul(a: i128, b: i128, p: i128) -> i128 {
+    let a = a.rem_euclid(p) as u128;
+    let b = b.rem_euclid(p) as u128;
+
+    let a_lo = a & 0xFFFF_FFFF_FFFF_FFFF;
+    let a_hi = a >> 64;
+    let b_lo = b & 0xFFFF_FFFF_FFFF_FFFF;
+    let b_hi = b >> 64;
+
+    let term0 = a_lo * b_lo;
+    let term1_1 = a_lo * b_hi;
+    let term1_2 = a_hi * b_lo;
+    let term2 = a_hi * b_hi;
+
+    let r0 = reduce_u128(term0);
+
+    let r1_1 = reduce_u128(term1_1);
+    let r1_2 = reduce_u128(term1_2);
+    let r1 = reduce_u128(r1_1 + r1_2);
+
+    let r1_lo = r1 & 0x7FFF_FFFF_FFFF_FFFF;
+    let r1_hi = r1 >> 63;
+    let r1_scaled = reduce_u128((r1_lo << 64) + r1_hi);
+
+    let r2 = reduce_u128(term2);
+    let r2_scaled = reduce_u128(r2 << 1);
+
+    let sum1 = reduce_u128(r0 + r1_scaled);
+    let total = reduce_u128(sum1 + r2_scaled);
+    total as i128
+}
+
+/// Extended Euclidean algorithm for modular inverse.
+fn mod_inverse(a: i128, m: i128) -> i128 {
+    let a = a.rem_euclid(m);
+    let (mut old_r, mut r) = (a, m);
+    let (mut old_s, mut s) = (1_i128, 0_i128);
+
+    while r != 0 {
+        let q = old_r / r;
+        let tmp_r = r;
+        r = old_r - q * r;
+        old_r = tmp_r;
+
+        let tmp_s = s;
+        s = old_s - q * s;
+        old_s = tmp_s;
+    }
+
+    assert!(old_r == 1, "no modular inverse exists");
+    old_s.rem_euclid(m)
+}
+
+/// Scale a commitment mod P by a rational factor `scalar / scale`.
+fn scale_commitment(c: i128, scalar: i128, scale: i128) -> i128 {
+    let scaled = mod_mul(c, scalar, P);
+    let inv = mod_inverse(scale, P);
+    mod_mul(scaled, inv, P)
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WaterfallTier {
+    pub recipient: Symbol,
+    pub share_bps: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WaterfallResult {
+    pub recipient: Symbol,
+    pub commitment: i128,
+}
 
 /// Priority repayment routing.
 #[contract]
@@ -12,7 +106,47 @@ impl RepaymentWaterfall {
         if env.storage().instance().has(&symbol_short!("admin")) {
             panic!("already initialized");
         }
-        env.storage().instance().set(&symbol_short!("admin"), &admin);
+        env.storage()
+            .instance()
+            .set(&symbol_short!("admin"), &admin);
+    }
+
+    /// Split a total confidential commitment across multiple tiers according to basis points.
+    /// The sum of the split commitments is guaranteed to match the total commitment homomorphically.
+    pub fn split_commitment(
+        _env: Env,
+        total_commitment: i128,
+        tiers: Vec<WaterfallTier>,
+    ) -> Vec<WaterfallResult> {
+        let mut results = Vec::new(&_env);
+        let mut sum_bps: i128 = 0;
+
+        for tier in tiers.iter() {
+            assert!(tier.share_bps > 0, "tier share must be positive");
+            sum_bps += tier.share_bps;
+        }
+
+        assert!(sum_bps == 10_000, "shares must sum to exactly 10000 bps");
+
+        for tier in tiers.iter() {
+            let split_c = scale_commitment(total_commitment, tier.share_bps, 10_000);
+            results.push_back(WaterfallResult {
+                recipient: tier.recipient,
+                commitment: split_c,
+            });
+        }
+
+        results
+    }
+
+    /// Verify that the sum of the split parts equals the total commitment mod P.
+    /// This proves mathematical correctness of the split without revealing any plaintext values.
+    pub fn verify_split(_env: Env, parts: Vec<i128>, total: i128) -> bool {
+        let mut sum: u128 = 0;
+        for part in parts.iter() {
+            sum = reduce_u128(sum + (part as u128));
+        }
+        (sum as i128) == total.rem_euclid(P)
     }
 
     /// Protocol ping — extend with domain logic.
@@ -23,7 +157,7 @@ impl RepaymentWaterfall {
 
     /// Contract ABI / deployment marker for integrators.
     pub fn version(_env: Env) -> u32 {
-        1
+        2
     }
 }
 
@@ -78,3 +212,137 @@ impl RepaymentWaterfall {
 // Contribution by CelestinaBeing — 2026-04-27
 
 // Contribution by codemagician1949 — 2026-05-26
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::{symbol_short, Env};
+
+    fn setup() -> Env {
+        let env = Env::default();
+        env.mock_all_auths();
+        env
+    }
+
+    fn test_commitment(value: i128, blinding: i128) -> i128 {
+        let vg = mod_mul(value, G, P);
+        let rh = mod_mul(blinding, H, P);
+        let sum = (vg as u128) + (rh as u128);
+        reduce_u128(sum) as i128
+    }
+
+    #[test]
+    fn test_split_commitment_two_tiers_sums_correctly() {
+        let env = setup();
+        let total_c = test_commitment(100_000, 1234);
+
+        let mut tiers = Vec::new(&env);
+        tiers.push_back(WaterfallTier {
+            recipient: symbol_short!("lender"),
+            share_bps: 8_000, // 80%
+        });
+        tiers.push_back(WaterfallTier {
+            recipient: symbol_short!("fee"),
+            share_bps: 2_000, // 20%
+        });
+
+        let results = RepaymentWaterfall::split_commitment(env.clone(), total_c, tiers);
+        assert_eq!(results.len(), 2);
+
+        let mut parts = Vec::new(&env);
+        for res in results.iter() {
+            parts.push_back(res.commitment);
+        }
+
+        assert!(RepaymentWaterfall::verify_split(
+            env.clone(),
+            parts,
+            total_c
+        ));
+    }
+
+    #[test]
+    fn test_split_commitment_three_tiers_sums_correctly() {
+        let env = setup();
+        let total_c = test_commitment(250_000, 9999);
+
+        let mut tiers = Vec::new(&env);
+        tiers.push_back(WaterfallTier {
+            recipient: symbol_short!("lender1"),
+            share_bps: 5_000, // 50%
+        });
+        tiers.push_back(WaterfallTier {
+            recipient: symbol_short!("lender2"),
+            share_bps: 4_500, // 45%
+        });
+        tiers.push_back(WaterfallTier {
+            recipient: symbol_short!("fee"),
+            share_bps: 500, // 5%
+        });
+
+        let results = RepaymentWaterfall::split_commitment(env.clone(), total_c, tiers);
+        assert_eq!(results.len(), 3);
+
+        let mut parts = Vec::new(&env);
+        for res in results.iter() {
+            parts.push_back(res.commitment);
+        }
+
+        assert!(RepaymentWaterfall::verify_split(
+            env.clone(),
+            parts,
+            total_c
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "shares must sum to exactly 10000 bps")]
+    fn test_split_invalid_bps_sum_panics() {
+        let env = setup();
+        let total_c = test_commitment(100_000, 1234);
+
+        let mut tiers = Vec::new(&env);
+        tiers.push_back(WaterfallTier {
+            recipient: symbol_short!("lender"),
+            share_bps: 8_000,
+        });
+        tiers.push_back(WaterfallTier {
+            recipient: symbol_short!("fee"),
+            share_bps: 1_999, // Sum is 9,999
+        });
+
+        let _ = RepaymentWaterfall::split_commitment(env, total_c, tiers);
+    }
+
+    #[test]
+    #[should_panic(expected = "tier share must be positive")]
+    fn test_split_zero_bps_panics() {
+        let env = setup();
+        let total_c = test_commitment(100_000, 1234);
+
+        let mut tiers = Vec::new(&env);
+        tiers.push_back(WaterfallTier {
+            recipient: symbol_short!("lender"),
+            share_bps: 10_000,
+        });
+        tiers.push_back(WaterfallTier {
+            recipient: symbol_short!("fee"),
+            share_bps: 0,
+        });
+
+        let _ = RepaymentWaterfall::split_commitment(env, total_c, tiers);
+    }
+
+    #[test]
+    fn test_verify_split_tampered_fails() {
+        let env = setup();
+        let total_c = test_commitment(100_000, 1234);
+
+        let mut parts = Vec::new(&env);
+        // Sum to something else
+        parts.push_back(test_commitment(50_000, 1234));
+        parts.push_back(test_commitment(49_000, 1234));
+
+        assert!(!RepaymentWaterfall::verify_split(env, parts, total_c));
+    }
+}
