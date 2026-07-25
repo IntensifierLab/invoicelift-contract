@@ -1,3 +1,10 @@
+[package]
+name = "invoicelift-contract"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+publish = false
+
 [workspace]
 resolver = "2"
 members = [
@@ -15,3 +22,9 @@ ethnum = { path = "ethnum-1.5.0" }
 
 [workspace.package]
 rust-version = "1.78"
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+invoice-registry = { path = "invoice-registry", features = ["testutils"] }
+pool-manager = { path = "pool-manager", features = ["testutils"] }
+repayment-waterfall = { path = "repayment-waterfall", features = ["testutils"] }

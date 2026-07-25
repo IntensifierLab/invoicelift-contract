@@ -16,6 +16,8 @@ jobs:
           targets: wasm32-unknown-unknown
       - name: Cargo check workspace
         run: cargo check --workspace
+      - name: Run tests (unit + integration)
+        run: cargo test --workspace
 
   wasm-size:
     name: WASM size check
