@@ -13,6 +13,12 @@ mod storage {
     pub const NAV: Symbol = symbol_short!("nav");
     /// Governance flag: excludes this pool from being picked as a rebalancing donor.
     pub const DONOR_BLK: Symbol = symbol_short!("dnr_blk");
+    /// Address authorized to queue/cancel timelocked admin actions. Separate
+    /// from the legacy `ADMIN` symbol tag: this is a real `Address` so it can
+    /// be authenticated with `require_auth`.
+    pub const ADMIN_ADDR: Symbol = symbol_short!("adm_addr");
+    /// Next id to assign to a queued timelocked action.
+    pub const NEXT_ACTION: Symbol = symbol_short!("nxt_act");
 }
 
 /// Reserve coverage floor, in basis points (500 = 5%). Rebalancing targets keeping
@@ -22,6 +28,28 @@ const RESERVE_FLOOR_BPS: i128 = 500;
 /// excess reserve above its own floor (5_000 = 50%).
 const DONOR_CAP_BPS: i128 = 5_000;
 const BPS_SCALE: i128 = 10_000;
+
+/// Minimum delay between queuing an admin parameter change and executing it,
+/// giving LPs an exit window before the change takes effect.
+const TIMELOCK_SECS: u64 = 48 * 60 * 60;
+
+/// A queued, timelocked change to a named admin parameter.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueuedAction {
+    pub id: u32,
+    pub param: Symbol,
+    pub new_value: i128,
+    pub queued_at: u64,
+    pub execute_after: u64,
+    pub executed: bool,
+    pub cancelled: bool,
+}
+
+/// Queued-action storage key.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActionKey(pub u32);
 
 /// Per-lender LP record.
 #[contracttype]
@@ -368,6 +396,135 @@ impl PoolManager {
         true
     }
 
+    // ── timelocked admin actions ────────────────────────────────────────
+
+    /// One-time bootstrap binding an `Address` that must authorize timelocked
+    /// admin actions (`queue_parameter_change`, `cancel_parameter_change`).
+    /// Additive: independent of the legacy `Symbol` admin tag set in
+    /// `initialize`, so it does not change that function's signature.
+    pub fn set_timelock_admin(env: Env, admin: Address) {
+        if env.storage().instance().has(&storage::ADMIN_ADDR) {
+            panic!("timelock admin already set");
+        }
+        env.storage().instance().set(&storage::ADMIN_ADDR, &admin);
+    }
+
+    /// Queues a change of `param` to `new_value`, executable no earlier than
+    /// 48h from now. Requires the timelock admin's authorization. Returns the
+    /// new action's id. Emits `ActionQueued`.
+    pub fn queue_parameter_change(env: Env, param: Symbol, new_value: i128) -> u32 {
+        Self::require_timelock_admin(&env);
+
+        let id: u32 = env
+            .storage()
+            .instance()
+            .get(&storage::NEXT_ACTION)
+            .unwrap_or(0);
+        env.storage().instance().set(&storage::NEXT_ACTION, &(id + 1));
+
+        let queued_at = env.ledger().timestamp();
+        let execute_after = queued_at + TIMELOCK_SECS;
+        let action = QueuedAction {
+            id,
+            param: param.clone(),
+            new_value,
+            queued_at,
+            execute_after,
+            executed: false,
+            cancelled: false,
+        };
+        env.storage().persistent().set(&ActionKey(id), &action);
+
+        env.events().publish(
+            (symbol_short!("act_qd"), id),
+            (param, new_value, execute_after),
+        );
+        id
+    }
+
+    /// Executes a queued action once its timelock has elapsed. Callable by
+    /// anyone — the outcome is fully determined by the queued state and the
+    /// current ledger time, mirroring `governance::execute_proposal`. Emits
+    /// `ActionExecuted`.
+    pub fn execute_parameter_change(env: Env, id: u32) {
+        let mut action = Self::read_action(&env, id);
+        assert!(!action.cancelled, "action was cancelled");
+        assert!(!action.executed, "action already executed");
+        assert!(
+            env.ledger().timestamp() >= action.execute_after,
+            "timelock has not elapsed"
+        );
+
+        Self::apply_parameter(&env, &action.param, action.new_value);
+
+        action.executed = true;
+        env.storage().persistent().set(&ActionKey(id), &action);
+
+        env.events().publish(
+            (symbol_short!("act_exec"), id),
+            (action.param.clone(), action.new_value),
+        );
+    }
+
+    /// Cancels a queued action before it executes. Requires the timelock
+    /// admin's authorization. Emits `ActionCancelled`.
+    pub fn cancel_parameter_change(env: Env, id: u32) {
+        Self::require_timelock_admin(&env);
+
+        let mut action = Self::read_action(&env, id);
+        assert!(!action.executed, "action already executed");
+        assert!(!action.cancelled, "action already cancelled");
+
+        action.cancelled = true;
+        env.storage().persistent().set(&ActionKey(id), &action);
+
+        env.events()
+            .publish((symbol_short!("act_cxl"), id), (action.param.clone(),));
+    }
+
+    pub fn get_queued_action(env: Env, id: u32) -> Option<QueuedAction> {
+        env.storage().persistent().get(&ActionKey(id))
+    }
+
+    pub fn timelock_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&storage::ADMIN_ADDR)
+    }
+
+    fn require_timelock_admin(env: &Env) -> Address {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&storage::ADMIN_ADDR)
+            .unwrap_or_else(|| panic!("timelock admin not set"));
+        admin.require_auth();
+        admin
+    }
+
+    fn read_action(env: &Env, id: u32) -> QueuedAction {
+        env.storage()
+            .persistent()
+            .get(&ActionKey(id))
+            .unwrap_or_else(|| panic!("action not found"))
+    }
+
+    /// Applies a queued change for a known parameter name. `max_ut` maps to
+    /// max utilisation, re-clamping `financed_amount` if the new ceiling is
+    /// now below it (mirroring `set_nav`'s clamp).
+    fn apply_parameter(env: &Env, param: &Symbol, new_value: i128) {
+        if *param == storage::MAX_UTIL {
+            env.storage().instance().set(&storage::MAX_UTIL, &new_value);
+
+            let cap: i128 = env.storage().instance().get(&storage::TOTAL_CAPITAL).unwrap_or(0);
+            let fin: i128 = env.storage().instance().get(&storage::FINANCED_AMT).unwrap_or(0);
+            let limit = cap * new_value / BPS_SCALE;
+            if fin > limit {
+                env.storage().instance().set(&storage::FINANCED_AMT, &limit);
+            }
+        } else {
+            panic!("unknown parameter");
+        }
+    }
+
     /// Contract ABI / deployment marker for integrators.
     pub fn version(_env: Env) -> u32 {
         1
@@ -381,7 +538,7 @@ impl PoolManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::{Address as _, Ledger as _};
     use soroban_sdk::{Address, Env};
 
     fn setup() -> (Env, soroban_sdk::Address) {
@@ -877,6 +1034,144 @@ mod tests {
         env.as_contract(&needy, || {
             assert_eq!(PoolManager::total_capital(env.clone()), 100_475);
             assert_eq!(PoolManager::reserve(env.clone()), 1_475);
+        });
+    }
+
+    // ── Timelocked admin actions ──────────────────────────────────────
+
+    fn advance_time(env: &Env, by_secs: u64) {
+        let now = env.ledger().timestamp();
+        env.ledger().with_mut(|li| li.timestamp = now + by_secs);
+    }
+
+    #[test]
+    fn queue_execute_and_read_a_parameter_change() {
+        let (env, contract_addr) = setup();
+        let admin_addr = Address::generate(&env);
+
+        let id = env.as_contract(&contract_addr, || {
+            PoolManager::set_timelock_admin(env.clone(), admin_addr.clone());
+            PoolManager::queue_parameter_change(env.clone(), storage::MAX_UTIL, 9_000)
+        });
+
+        env.as_contract(&contract_addr, || {
+            let action = PoolManager::get_queued_action(env.clone(), id).unwrap();
+            assert_eq!(action.new_value, 9_000);
+            assert!(!action.executed);
+            assert!(!action.cancelled);
+            assert_eq!(action.execute_after - action.queued_at, 48 * 60 * 60);
+        });
+
+        advance_time(&env, 48 * 60 * 60);
+
+        env.as_contract(&contract_addr, || {
+            PoolManager::execute_parameter_change(env.clone(), id);
+            assert_eq!(PoolManager::max_utilisation(env.clone()), 9_000);
+            let action = PoolManager::get_queued_action(env.clone(), id).unwrap();
+            assert!(action.executed);
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "timelock has not elapsed")]
+    fn execute_before_timelock_elapses_panics() {
+        let (env, contract_addr) = setup();
+        let admin_addr = Address::generate(&env);
+
+        let id = env.as_contract(&contract_addr, || {
+            PoolManager::set_timelock_admin(env.clone(), admin_addr);
+            PoolManager::queue_parameter_change(env.clone(), storage::MAX_UTIL, 9_000)
+        });
+
+        advance_time(&env, 47 * 60 * 60);
+
+        env.as_contract(&contract_addr, || {
+            PoolManager::execute_parameter_change(env.clone(), id);
+        });
+    }
+
+    #[test]
+    fn cancel_marks_the_action_cancelled() {
+        let (env, contract_addr) = setup();
+        let admin_addr = Address::generate(&env);
+
+        let id = env.as_contract(&contract_addr, || {
+            PoolManager::set_timelock_admin(env.clone(), admin_addr);
+            PoolManager::queue_parameter_change(env.clone(), storage::MAX_UTIL, 9_000)
+        });
+
+        env.as_contract(&contract_addr, || {
+            PoolManager::cancel_parameter_change(env.clone(), id);
+            let action = PoolManager::get_queued_action(env.clone(), id).unwrap();
+            assert!(action.cancelled);
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "action was cancelled")]
+    fn execute_after_cancel_panics() {
+        let (env, contract_addr) = setup();
+        let admin_addr = Address::generate(&env);
+
+        let id = env.as_contract(&contract_addr, || {
+            PoolManager::set_timelock_admin(env.clone(), admin_addr);
+            PoolManager::queue_parameter_change(env.clone(), storage::MAX_UTIL, 9_000)
+        });
+
+        env.as_contract(&contract_addr, || {
+            PoolManager::cancel_parameter_change(env.clone(), id);
+        });
+
+        advance_time(&env, 48 * 60 * 60);
+
+        env.as_contract(&contract_addr, || {
+            PoolManager::execute_parameter_change(env.clone(), id);
+        });
+    }
+
+    #[test]
+    fn execute_reclamps_financed_amount_when_ceiling_drops() {
+        let (env, contract_addr) = setup();
+        let admin_addr = Address::generate(&env);
+        let alice = symbol_short!("alice");
+
+        env.as_contract(&contract_addr, || {
+            PoolManager::deposit(env.clone(), alice, 100_000);
+            PoolManager::finance(env.clone(), 75_000); // within the initial 80% ceiling
+        });
+
+        let id = env.as_contract(&contract_addr, || {
+            PoolManager::set_timelock_admin(env.clone(), admin_addr);
+            PoolManager::queue_parameter_change(env.clone(), storage::MAX_UTIL, 5_000)
+        });
+
+        advance_time(&env, 48 * 60 * 60);
+
+        env.as_contract(&contract_addr, || {
+            PoolManager::execute_parameter_change(env.clone(), id);
+            assert_eq!(PoolManager::max_utilisation(env.clone()), 5_000);
+            assert_eq!(PoolManager::financed_amount(env.clone()), 50_000);
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "timelock admin not set")]
+    fn queue_without_timelock_admin_set_panics() {
+        let (env, contract_addr) = setup();
+        env.as_contract(&contract_addr, || {
+            PoolManager::queue_parameter_change(env.clone(), storage::MAX_UTIL, 9_000);
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "timelock admin already set")]
+    fn set_timelock_admin_is_one_time() {
+        let (env, contract_addr) = setup();
+        let a = Address::generate(&env);
+        let b = Address::generate(&env);
+        env.as_contract(&contract_addr, || {
+            PoolManager::set_timelock_admin(env.clone(), a);
+            PoolManager::set_timelock_admin(env.clone(), b);
         });
     }
 }
