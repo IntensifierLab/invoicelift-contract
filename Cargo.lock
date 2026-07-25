@@ -859,6 +859,7 @@ dependencies = [
 name = "repayment-waterfall"
 version = "0.1.0"
 dependencies = [
+ "pool-manager",
  "soroban-sdk",
 ]
 
