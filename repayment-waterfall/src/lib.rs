@@ -9,7 +9,6 @@ const G: i128 = 5;
 #[allow(dead_code)]
 const H: i128 = 7;
 
-
 /// Helper to reduce a u128 modulo P = 2^127 - 1 using Mersenne prime properties.
 fn reduce_u128(x: u128) -> u128 {
     const P_U128: u128 = (1 << 127) - 1;

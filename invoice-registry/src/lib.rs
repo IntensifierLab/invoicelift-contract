@@ -57,8 +57,6 @@ pub struct CommittedInvoice {
 
 // ─── Contract ──────────────────────────────────────────────────────────────
 
-
-
 /// Invoice lifecycle and verification.
 #[contract]
 pub struct InvoiceRegistry;
@@ -73,9 +71,7 @@ impl InvoiceRegistry {
         if env.storage().instance().has(&storage::ADMIN) {
             panic!("already initialized");
         }
-        env.storage()
-            .instance()
-            .set(&storage::ADMIN, &admin);
+        env.storage().instance().set(&storage::ADMIN, &admin);
     }
 
     // ── Invoice lifecycle ────────────────────────────────────────────────
@@ -207,8 +203,6 @@ impl InvoiceRegistry {
     }
 }
 
-
-
 // Contribution check by nancy-k at 2024-11-21T23:51:43
 
 // Contribution check by oluwagbemiga at 2025-02-26T05:22:45
@@ -269,7 +263,6 @@ impl InvoiceRegistry {
 mod tests {
     use super::*;
     use soroban_sdk::{Address, Env};
-
 
     fn setup() -> (Env, soroban_sdk::Address) {
         let env = Env::default();

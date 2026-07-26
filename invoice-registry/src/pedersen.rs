@@ -196,7 +196,6 @@ mod tests {
         let scaled_c = scale_commitment(c, 3000, 10_000);
         let _direct_c = commit(v * 3000 / 10_000, r * 3000 / 10_000);
 
-
         // Due to modular arithmetic, direct scaling of v and r won't match
         // the commitment scaling exactly (integer division truncation).
         // Instead verify the property: scale_commitment is deterministic
