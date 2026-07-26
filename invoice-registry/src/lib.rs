@@ -57,20 +57,25 @@ pub struct CommittedInvoice {
 
 // ─── Contract ──────────────────────────────────────────────────────────────
 
+
+
 /// Invoice lifecycle and verification.
 #[contract]
 pub struct InvoiceRegistry;
 
 #[contractimpl]
 impl InvoiceRegistry {
-    /// One-time initialization (scaffold — replace with auth in production).
+    /// One-time initialization. Sets the initial administrator.
+    ///
+    /// Returns [`Error::AlreadyInitialized`] if the contract has already been
+    /// initialized, so the admin can never be silently overwritten.
     pub fn initialize(env: Env, admin: Symbol) {
-        if env.storage().instance().has(&symbol_short!("admin")) {
+        if env.storage().instance().has(&storage::ADMIN) {
             panic!("already initialized");
         }
         env.storage()
             .instance()
-            .set(&symbol_short!("admin"), &admin);
+            .set(&storage::ADMIN, &admin);
     }
 
     // ── Invoice lifecycle ────────────────────────────────────────────────
@@ -201,6 +206,8 @@ impl InvoiceRegistry {
         assert!(*caller == admin, "only admin");
     }
 }
+
+
 
 // Contribution check by nancy-k at 2024-11-21T23:51:43
 

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "governance",
     "invoice-registry",
     "pool-manager",
     "repayment-waterfall",

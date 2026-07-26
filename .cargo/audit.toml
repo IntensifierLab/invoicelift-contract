@@ -1,0 +1,29 @@
+# cargo-audit configuration — see https://github.com/rustsec/rustsec/tree/main/cargo-audit
+#
+# CI fails on any *new*, unlisted advisory. The entries below are explicitly
+# reviewed exceptions, each with a justification. They all live in the host /
+# `testutils` / build-time dependency tree pulled in for local testing — none
+# is reachable from the deployed `#![no_std]` contract Wasm, which links only
+# `soroban-sdk` without `testutils`.
+#
+# Review this list whenever dependencies change: an advisory should stay here
+# only while the "why it does not affect the deployed contract" note holds.
+
+[advisories]
+ignore = [
+    # curve25519-dalek: timing variability in Scalar sub. Pulled in by the
+    # Soroban host used for `testutils` simulation only; the deployed contract
+    # does no scalar arithmetic and never links this crate.
+    "RUSTSEC-2024-0344",
+    # time: DoS via stack exhaustion (medium). Build/dev tree only; not linked
+    # into the contract Wasm.
+    "RUSTSEC-2026-0009",
+    # adler: unmaintained. Transitive dev/build dependency (compression in the
+    # test toolchain); not in the contract.
+    "RUSTSEC-2025-0056",
+    # paste: unmaintained. Proc-macro build dependency only.
+    "RUSTSEC-2024-0436",
+    # rand: unsound with a custom logger via `rand::rng()`. Test/host tree only;
+    # the contract does not use `rand`.
+    "RUSTSEC-2026-0097",
+]

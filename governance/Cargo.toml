@@ -1,5 +1,5 @@
 [package]
-name = "repayment-waterfall"
+name = "governance"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.78"
@@ -12,7 +12,6 @@ soroban-sdk = { workspace = true }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
-pool-manager = { path = "../pool-manager", features = ["testutils"] }
 
 [features]
 testutils = ["soroban-sdk/testutils"]
