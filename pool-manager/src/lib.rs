@@ -1,4 +1,5 @@
 #![no_std]
+#[allow(unused_imports)]
 use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec};
 
 /// Persistent storage keys.
@@ -73,19 +74,23 @@ const NAV_SCALE: i128 = 1_000_000;
 #[contractimpl]
 impl PoolManager {
     /// One-time initialization with pool parameters.
-    pub fn initialize(
-        env: Env,
-        admin: Symbol,
-        max_utilisation: i128,
-    ) {
+    pub fn initialize(env: Env, admin: Symbol, max_utilisation: i128) {
         if env.storage().instance().has(&storage::ADMIN) {
             panic!("already initialized");
         }
         env.storage().instance().set(&storage::ADMIN, &admin);
-        env.storage().instance().set(&storage::TOTAL_SHARES, &0_i128);
-        env.storage().instance().set(&storage::TOTAL_CAPITAL, &0_i128);
-        env.storage().instance().set(&storage::FINANCED_AMT, &0_i128);
-        env.storage().instance().set(&storage::MAX_UTIL, &max_utilisation);
+        env.storage()
+            .instance()
+            .set(&storage::TOTAL_SHARES, &0_i128);
+        env.storage()
+            .instance()
+            .set(&storage::TOTAL_CAPITAL, &0_i128);
+        env.storage()
+            .instance()
+            .set(&storage::FINANCED_AMT, &0_i128);
+        env.storage()
+            .instance()
+            .set(&storage::MAX_UTIL, &max_utilisation);
         env.storage().instance().set(&storage::NAV, &NAV_SCALE);
     }
 
@@ -107,12 +112,19 @@ impl PoolManager {
             .persistent()
             .get(&key)
             .unwrap_or(LenderPosition { shares: 0 });
-        env.storage()
-            .persistent()
-            .set(&key, &LenderPosition { shares: pos.shares + shares });
+        env.storage().persistent().set(
+            &key,
+            &LenderPosition {
+                shares: pos.shares + shares,
+            },
+        );
 
         // update totals — derive capital from shares to keep invariant exact
-        let tot_shares: i128 = env.storage().instance().get(&storage::TOTAL_SHARES).unwrap();
+        let tot_shares: i128 = env
+            .storage()
+            .instance()
+            .get(&storage::TOTAL_SHARES)
+            .unwrap();
         let new_tot_shares = tot_shares + shares;
 
         env.storage()
@@ -140,11 +152,18 @@ impl PoolManager {
         let nav: i128 = env.storage().instance().get(&storage::NAV).unwrap();
         let amount = shares * nav / NAV_SCALE;
 
-        env.storage()
-            .persistent()
-            .set(&key, &LenderPosition { shares: pos.shares - shares });
+        env.storage().persistent().set(
+            &key,
+            &LenderPosition {
+                shares: pos.shares - shares,
+            },
+        );
 
-        let tot_shares: i128 = env.storage().instance().get(&storage::TOTAL_SHARES).unwrap();
+        let tot_shares: i128 = env
+            .storage()
+            .instance()
+            .get(&storage::TOTAL_SHARES)
+            .unwrap();
         let new_tot_shares = tot_shares - shares;
         let new_capital = new_tot_shares * nav / NAV_SCALE;
 
@@ -156,13 +175,15 @@ impl PoolManager {
             .set(&storage::TOTAL_CAPITAL, &new_capital);
 
         // clamp financed_amount if withdrawal reduced available capacity
-        let fin: i128 = env.storage().instance().get(&storage::FINANCED_AMT).unwrap();
+        let fin: i128 = env
+            .storage()
+            .instance()
+            .get(&storage::FINANCED_AMT)
+            .unwrap();
         let max_util: i128 = env.storage().instance().get(&storage::MAX_UTIL).unwrap();
         let limit = new_capital * max_util / 10_000;
         if fin > limit {
-            env.storage()
-                .instance()
-                .set(&storage::FINANCED_AMT, &limit);
+            env.storage().instance().set(&storage::FINANCED_AMT, &limit);
         }
 
         amount
@@ -173,8 +194,16 @@ impl PoolManager {
     pub fn finance(env: Env, amount: i128) {
         assert!(amount > 0, "amount must be positive");
 
-        let fin: i128 = env.storage().instance().get(&storage::FINANCED_AMT).unwrap();
-        let tot_capital: i128 = env.storage().instance().get(&storage::TOTAL_CAPITAL).unwrap();
+        let fin: i128 = env
+            .storage()
+            .instance()
+            .get(&storage::FINANCED_AMT)
+            .unwrap();
+        let tot_capital: i128 = env
+            .storage()
+            .instance()
+            .get(&storage::TOTAL_CAPITAL)
+            .unwrap();
         let max_util: i128 = env.storage().instance().get(&storage::MAX_UTIL).unwrap();
 
         let new_fin = fin + amount;
@@ -194,7 +223,11 @@ impl PoolManager {
     pub fn set_nav(env: Env, new_nav: i128) {
         assert!(new_nav > 0, "NAV must be positive");
 
-        let tot_shares: i128 = env.storage().instance().get(&storage::TOTAL_SHARES).unwrap();
+        let tot_shares: i128 = env
+            .storage()
+            .instance()
+            .get(&storage::TOTAL_SHARES)
+            .unwrap();
         let max_util: i128 = env.storage().instance().get(&storage::MAX_UTIL).unwrap();
         let new_capital = tot_shares * new_nav / NAV_SCALE;
 
@@ -204,36 +237,53 @@ impl PoolManager {
             .set(&storage::TOTAL_CAPITAL, &new_capital);
 
         // clamp financed_amount if NAV drop reduced available capacity
-        let fin: i128 = env.storage().instance().get(&storage::FINANCED_AMT).unwrap();
+        let fin: i128 = env
+            .storage()
+            .instance()
+            .get(&storage::FINANCED_AMT)
+            .unwrap();
         let limit = new_capital * max_util / 10_000;
         if fin > limit {
-            env.storage()
-                .instance()
-                .set(&storage::FINANCED_AMT, &limit);
+            env.storage().instance().set(&storage::FINANCED_AMT, &limit);
         }
     }
 
     // ── view helpers ──────────────────────────────────────────────────
 
     pub fn total_shares(env: Env) -> i128 {
-        env.storage().instance().get(&storage::TOTAL_SHARES).unwrap_or(0)
+        env.storage()
+            .instance()
+            .get(&storage::TOTAL_SHARES)
+            .unwrap_or(0)
     }
 
     /// total_capital = total_shares * NAV / NAV_SCALE — the pool's total value.
     pub fn total_capital(env: Env) -> i128 {
-        env.storage().instance().get(&storage::TOTAL_CAPITAL).unwrap_or(0)
+        env.storage()
+            .instance()
+            .get(&storage::TOTAL_CAPITAL)
+            .unwrap_or(0)
     }
 
     pub fn financed_amount(env: Env) -> i128 {
-        env.storage().instance().get(&storage::FINANCED_AMT).unwrap_or(0)
+        env.storage()
+            .instance()
+            .get(&storage::FINANCED_AMT)
+            .unwrap_or(0)
     }
 
     pub fn max_utilisation(env: Env) -> i128 {
-        env.storage().instance().get(&storage::MAX_UTIL).unwrap_or(0)
+        env.storage()
+            .instance()
+            .get(&storage::MAX_UTIL)
+            .unwrap_or(0)
     }
 
     pub fn nav(env: Env) -> i128 {
-        env.storage().instance().get(&storage::NAV).unwrap_or(NAV_SCALE)
+        env.storage()
+            .instance()
+            .get(&storage::NAV)
+            .unwrap_or(NAV_SCALE)
     }
 
     pub fn lender_shares(env: Env, lender: Symbol) -> i128 {
@@ -248,8 +298,16 @@ impl PoolManager {
 
     /// Idle liquidity: capital not currently financed.
     pub fn reserve(env: Env) -> i128 {
-        let cap: i128 = env.storage().instance().get(&storage::TOTAL_CAPITAL).unwrap_or(0);
-        let fin: i128 = env.storage().instance().get(&storage::FINANCED_AMT).unwrap_or(0);
+        let cap: i128 = env
+            .storage()
+            .instance()
+            .get(&storage::TOTAL_CAPITAL)
+            .unwrap_or(0);
+        let fin: i128 = env
+            .storage()
+            .instance()
+            .get(&storage::FINANCED_AMT)
+            .unwrap_or(0);
         cap - fin
     }
 
@@ -259,15 +317,26 @@ impl PoolManager {
     }
 
     pub fn is_donor_blocked(env: Env) -> bool {
-        env.storage().instance().get(&storage::DONOR_BLK).unwrap_or(false)
+        env.storage()
+            .instance()
+            .get(&storage::DONOR_BLK)
+            .unwrap_or(false)
     }
 
     /// Applies a capital delta from a reserve rebalance (positive = received,
     /// negative = donated). NAV is re-derived so the shares/NAV/capital invariant
     /// holds; financed_amount is clamped if the new capital can no longer support it.
     pub fn apply_reserve_delta(env: Env, delta: i128) {
-        let tot_shares: i128 = env.storage().instance().get(&storage::TOTAL_SHARES).unwrap_or(0);
-        let tot_capital: i128 = env.storage().instance().get(&storage::TOTAL_CAPITAL).unwrap_or(0);
+        let tot_shares: i128 = env
+            .storage()
+            .instance()
+            .get(&storage::TOTAL_SHARES)
+            .unwrap_or(0);
+        let tot_capital: i128 = env
+            .storage()
+            .instance()
+            .get(&storage::TOTAL_CAPITAL)
+            .unwrap_or(0);
         let new_capital = tot_capital + delta;
         assert!(new_capital >= 0, "rebalance would leave negative capital");
 
@@ -276,10 +345,20 @@ impl PoolManager {
             assert!(new_nav > 0, "rebalance would zero NAV");
             env.storage().instance().set(&storage::NAV, &new_nav);
         }
-        env.storage().instance().set(&storage::TOTAL_CAPITAL, &new_capital);
+        env.storage()
+            .instance()
+            .set(&storage::TOTAL_CAPITAL, &new_capital);
 
-        let fin: i128 = env.storage().instance().get(&storage::FINANCED_AMT).unwrap_or(0);
-        let max_util: i128 = env.storage().instance().get(&storage::MAX_UTIL).unwrap_or(0);
+        let fin: i128 = env
+            .storage()
+            .instance()
+            .get(&storage::FINANCED_AMT)
+            .unwrap_or(0);
+        let max_util: i128 = env
+            .storage()
+            .instance()
+            .get(&storage::MAX_UTIL)
+            .unwrap_or(0);
         let limit = new_capital * max_util / 10_000;
         if fin > limit {
             env.storage().instance().set(&storage::FINANCED_AMT, &limit);
@@ -301,10 +380,22 @@ impl PoolManager {
     /// self re-entrant calls); peers are reached via `PoolManagerClient`.
     pub fn rebalance_reserves(env: Env, peers: Vec<Address>) -> bool {
         let self_addr = env.current_contract_address();
-        let self_capital: i128 = env.storage().instance().get(&storage::TOTAL_CAPITAL).unwrap_or(0);
-        let self_fin: i128 = env.storage().instance().get(&storage::FINANCED_AMT).unwrap_or(0);
+        let self_capital: i128 = env
+            .storage()
+            .instance()
+            .get(&storage::TOTAL_CAPITAL)
+            .unwrap_or(0);
+        let self_fin: i128 = env
+            .storage()
+            .instance()
+            .get(&storage::FINANCED_AMT)
+            .unwrap_or(0);
         let self_reserve = self_capital - self_fin;
-        let self_blocked: bool = env.storage().instance().get(&storage::DONOR_BLK).unwrap_or(false);
+        let self_blocked: bool = env
+            .storage()
+            .instance()
+            .get(&storage::DONOR_BLK)
+            .unwrap_or(false);
 
         let mut needy: Option<(Address, i128, i128)> = None; // (addr, reserve, capital)
         let mut needy_bps: i128 = RESERVE_FLOOR_BPS;
@@ -420,7 +511,9 @@ impl PoolManager {
             .instance()
             .get(&storage::NEXT_ACTION)
             .unwrap_or(0);
-        env.storage().instance().set(&storage::NEXT_ACTION, &(id + 1));
+        env.storage()
+            .instance()
+            .set(&storage::NEXT_ACTION, &(id + 1));
 
         let queued_at = env.ledger().timestamp();
         let execute_after = queued_at + TIMELOCK_SECS;
@@ -514,8 +607,16 @@ impl PoolManager {
         if *param == storage::MAX_UTIL {
             env.storage().instance().set(&storage::MAX_UTIL, &new_value);
 
-            let cap: i128 = env.storage().instance().get(&storage::TOTAL_CAPITAL).unwrap_or(0);
-            let fin: i128 = env.storage().instance().get(&storage::FINANCED_AMT).unwrap_or(0);
+            let cap: i128 = env
+                .storage()
+                .instance()
+                .get(&storage::TOTAL_CAPITAL)
+                .unwrap_or(0);
+            let fin: i128 = env
+                .storage()
+                .instance()
+                .get(&storage::FINANCED_AMT)
+                .unwrap_or(0);
             let limit = cap * new_value / BPS_SCALE;
             if fin > limit {
                 env.storage().instance().set(&storage::FINANCED_AMT, &limit);
@@ -949,9 +1050,7 @@ mod tests {
         let mut peers = Vec::new(&env);
         peers.push_back(b.clone());
 
-        let moved = env.as_contract(&a, || {
-            PoolManager::rebalance_reserves(env.clone(), peers)
-        });
+        let moved = env.as_contract(&a, || PoolManager::rebalance_reserves(env.clone(), peers));
         assert!(!moved);
     }
 
