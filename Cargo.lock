@@ -604,6 +604,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "invoicelift-contract"
+version = "0.1.0"
+dependencies = [
+ "invoice-registry",
+ "pool-manager",
+ "repayment-waterfall",
+ "soroban-sdk",
+]
+
+[[package]]
 name = "itertools"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
