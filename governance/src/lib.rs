@@ -8,7 +8,7 @@ use soroban_sdk::{
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
-pub enum Error {
+pub enum ContractError {
     /// `initialize` called on an already-initialized contract.
     AlreadyInitialized = 1,
     /// An admin-guarded or proposal call was made before `initialize`.
@@ -28,6 +28,8 @@ pub enum Error {
     AlreadyVoted = 8,
     /// The proposal has already been executed (or finalized as rejected).
     AlreadyFinalized = 9,
+    /// `set_voting_power` was called with a negative power value.
+    NegativePower = 10,
 }
 
 /// Storage keys for the governance module's instance/persistent state.
@@ -128,16 +130,16 @@ impl Governance {
         voting_period_secs: u64,
         quorum_bps: u32,
         supermajority_bps: u32,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ContractError> {
         if env.storage().instance().has(&DataKey::Admin) {
-            return Err(Error::AlreadyInitialized);
+            return Err(ContractError::AlreadyInitialized);
         }
         if quorum_bps == 0
             || quorum_bps > BPS_SCALE
             || supermajority_bps <= STANDARD_THRESHOLD_BPS
             || supermajority_bps > BPS_SCALE
         {
-            return Err(Error::InvalidConfig);
+            return Err(ContractError::InvalidConfig);
         }
 
         env.storage().instance().set(&DataKey::Admin, &admin);
@@ -159,8 +161,10 @@ impl Governance {
 
     /// Admin-only: sets `voter`'s voting power (replacing any prior value).
     /// Requires the admin's authorization.
-    pub fn set_voting_power(env: Env, voter: Address, power: i128) -> Result<(), Error> {
-        assert!(power >= 0, "power must not be negative");
+    pub fn set_voting_power(env: Env, voter: Address, power: i128) -> Result<(), ContractError> {
+        if power < 0 {
+            return Err(ContractError::NegativePower);
+        }
         let admin = Self::read_admin(&env)?;
         admin.require_auth();
 
@@ -188,13 +192,13 @@ impl Governance {
         kind: ProposalKind,
         param: Symbol,
         new_value: i128,
-    ) -> Result<u32, Error> {
+    ) -> Result<u32, ContractError> {
         proposer.require_auth();
         // read_admin doubles as the "has `initialize` run?" guard, since every
         // instance key below it is set atomically in the same call.
         Self::read_admin(&env)?;
         if Self::get_voting_power(env.clone(), proposer.clone()) == 0 {
-            return Err(Error::NoVotingPower);
+            return Err(ContractError::NoVotingPower);
         }
 
         let id: u32 = env
@@ -240,25 +244,30 @@ impl Governance {
     /// Requires `voter`'s authorization. If this vote pushes the tally past
     /// both quorum and the required majority, the proposal auto-executes in
     /// this same call — see the type-level docs. Returns whether it did.
-    pub fn vote(env: Env, proposal_id: u32, voter: Address, support: bool) -> Result<bool, Error> {
+    pub fn vote(
+        env: Env,
+        proposal_id: u32,
+        voter: Address,
+        support: bool,
+    ) -> Result<bool, ContractError> {
         voter.require_auth();
 
         let power = Self::get_voting_power(env.clone(), voter.clone());
         if power == 0 {
-            return Err(Error::NoVotingPower);
+            return Err(ContractError::NoVotingPower);
         }
 
         let mut proposal = Self::read_proposal(&env, proposal_id)?;
         if proposal.executed {
-            return Err(Error::AlreadyFinalized);
+            return Err(ContractError::AlreadyFinalized);
         }
         if env.ledger().timestamp() >= proposal.voting_end {
-            return Err(Error::VotingClosed);
+            return Err(ContractError::VotingClosed);
         }
 
         let voted_key = DataKey::Voted(proposal_id, voter.clone());
         if env.storage().persistent().has(&voted_key) {
-            return Err(Error::AlreadyVoted);
+            return Err(ContractError::AlreadyVoted);
         }
         env.storage().persistent().set(&voted_key, &true);
 
@@ -285,13 +294,13 @@ impl Governance {
     /// didn't. Idempotent — re-calling an already-executed proposal returns
     /// `Ok(true)` without effect. Callable by anyone, since the outcome is
     /// fully determined by the recorded tally and the current time.
-    pub fn execute_proposal(env: Env, proposal_id: u32) -> Result<bool, Error> {
+    pub fn execute_proposal(env: Env, proposal_id: u32) -> Result<bool, ContractError> {
         let mut proposal = Self::read_proposal(&env, proposal_id)?;
         if proposal.executed {
             return Ok(true);
         }
         if env.ledger().timestamp() < proposal.voting_end {
-            return Err(Error::VotingStillOpen);
+            return Err(ContractError::VotingStillOpen);
         }
 
         let executed = Self::try_execute(&env, &mut proposal)?;
@@ -303,7 +312,7 @@ impl Governance {
 
     // ── view helpers ──────────────────────────────────────────────────
 
-    pub fn get_proposal(env: Env, proposal_id: u32) -> Result<Proposal, Error> {
+    pub fn get_proposal(env: Env, proposal_id: u32) -> Result<Proposal, ContractError> {
         Self::read_proposal(&env, proposal_id)
     }
 
@@ -334,18 +343,18 @@ impl Governance {
 
     // ── internal helpers ──────────────────────────────────────────────
 
-    fn read_admin(env: &Env) -> Result<Address, Error> {
+    fn read_admin(env: &Env) -> Result<Address, ContractError> {
         env.storage()
             .instance()
             .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)
+            .ok_or(ContractError::NotInitialized)
     }
 
-    fn read_proposal(env: &Env, proposal_id: u32) -> Result<Proposal, Error> {
+    fn read_proposal(env: &Env, proposal_id: u32) -> Result<Proposal, ContractError> {
         env.storage()
             .persistent()
             .get(&DataKey::Proposal(proposal_id))
-            .ok_or(Error::ProposalNotFound)
+            .ok_or(ContractError::ProposalNotFound)
     }
 
     /// Evaluates `proposal`'s tally against quorum and its required majority.
@@ -353,7 +362,7 @@ impl Governance {
     /// `executed`; a failing tally is left as-is (not marked executed) so a
     /// still-open proposal can keep collecting votes. Mutates `proposal` in
     /// place; the caller is responsible for persisting it.
-    fn try_execute(env: &Env, proposal: &mut Proposal) -> Result<bool, Error> {
+    fn try_execute(env: &Env, proposal: &mut Proposal) -> Result<bool, ContractError> {
         let total_power: i128 = env
             .storage()
             .instance()
