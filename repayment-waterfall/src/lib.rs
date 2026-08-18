@@ -1,5 +1,7 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Env, Symbol, Vec};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, symbol_short, Env, Symbol, Vec,
+};
 
 /// Pedersen constants matching those in the invoice registry.
 const P: i128 = i128::MAX;
@@ -52,8 +54,28 @@ fn mod_mul(a: i128, b: i128, p: i128) -> i128 {
     total as i128
 }
 
+/// Errors surfaced by the repayment waterfall. Stable `u32` discriminants so
+/// integrators and audit tooling can match on them.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum ContractError {
+    /// `initialize` called on an already-initialized contract.
+    AlreadyInitialized = 1,
+    /// A repayment amount was not strictly positive.
+    InvalidAmount = 2,
+    /// `process_repayment` was called before `initialize` configured a pool manager.
+    PoolManagerNotConfigured = 3,
+    /// A tier's share was not strictly positive.
+    InvalidTierShare = 4,
+    /// Tier shares did not sum to exactly 10_000 basis points.
+    InvalidBpsSum = 5,
+    /// A tier share scale could not be inverted modulo P (not coprime).
+    ScaleNotInvertible = 6,
+}
+
 /// Extended Euclidean algorithm for modular inverse.
-fn mod_inverse(a: i128, m: i128) -> i128 {
+fn mod_inverse(a: i128, m: i128) -> Result<i128, ContractError> {
     let a = a.rem_euclid(m);
     let (mut old_r, mut r) = (a, m);
     let (mut old_s, mut s) = (1_i128, 0_i128);
@@ -69,15 +91,17 @@ fn mod_inverse(a: i128, m: i128) -> i128 {
         old_s = tmp_s;
     }
 
-    assert!(old_r == 1, "no modular inverse exists");
-    old_s.rem_euclid(m)
+    if old_r != 1 {
+        return Err(ContractError::ScaleNotInvertible);
+    }
+    Ok(old_s.rem_euclid(m))
 }
 
 /// Scale a commitment mod P by a rational factor `scalar / scale`.
-fn scale_commitment(c: i128, scalar: i128, scale: i128) -> i128 {
+fn scale_commitment(c: i128, scalar: i128, scale: i128) -> Result<i128, ContractError> {
     let scaled = mod_mul(c, scalar, P);
-    let inv = mod_inverse(scale, P);
-    mod_mul(scaled, inv, P)
+    let inv = mod_inverse(scale, P)?;
+    Ok(mod_mul(scaled, inv, P))
 }
 
 #[contracttype]
@@ -118,14 +142,15 @@ impl RepaymentWaterfall {
     /// One-time initialization (scaffold — replace with auth in production).
     /// `pool_manager` is the deployed PoolManager contract this waterfall
     /// forwards repayments to.
-    pub fn initialize(env: Env, admin: Symbol, pool_manager: Address) {
+    pub fn initialize(env: Env, admin: Symbol, pool_manager: Address) -> Result<(), ContractError> {
         if env.storage().instance().has(&symbol_short!("admin")) {
-            panic!("already initialized");
+            return Err(ContractError::AlreadyInitialized);
         }
         env.storage()
             .instance()
             .set(&symbol_short!("admin"), &admin);
         env.storage().instance().set(&POOL_MANAGER, &pool_manager);
+        Ok(())
     }
 
     /// Split a total confidential commitment across multiple tiers according to basis points.
@@ -134,26 +159,30 @@ impl RepaymentWaterfall {
         _env: Env,
         total_commitment: i128,
         tiers: Vec<WaterfallTier>,
-    ) -> Vec<WaterfallResult> {
+    ) -> Result<Vec<WaterfallResult>, ContractError> {
         let mut results = Vec::new(&_env);
         let mut sum_bps: i128 = 0;
 
         for tier in tiers.iter() {
-            assert!(tier.share_bps > 0, "tier share must be positive");
+            if tier.share_bps <= 0 {
+                return Err(ContractError::InvalidTierShare);
+            }
             sum_bps += tier.share_bps;
         }
 
-        assert!(sum_bps == 10_000, "shares must sum to exactly 10000 bps");
+        if sum_bps != 10_000 {
+            return Err(ContractError::InvalidBpsSum);
+        }
 
         for tier in tiers.iter() {
-            let split_c = scale_commitment(total_commitment, tier.share_bps, 10_000);
+            let split_c = scale_commitment(total_commitment, tier.share_bps, 10_000)?;
             results.push_back(WaterfallResult {
                 recipient: tier.recipient,
                 commitment: split_c,
             });
         }
 
-        results
+        Ok(results)
     }
 
     /// Verify that the sum of the split parts equals the total commitment mod P.
@@ -171,16 +200,19 @@ impl RepaymentWaterfall {
     /// cross-contract call panics (aborting this transaction, including any
     /// storage writes already made) if pool-manager rejects it — e.g. if the
     /// repayment would leave the pool with negative capital.
-    pub fn process_repayment(env: Env, amount: i128) {
-        assert!(amount > 0, "amount must be positive");
+    pub fn process_repayment(env: Env, amount: i128) -> Result<(), ContractError> {
+        if amount <= 0 {
+            return Err(ContractError::InvalidAmount);
+        }
 
         let pool_manager: Address = env
             .storage()
             .instance()
             .get(&POOL_MANAGER)
-            .unwrap_or_else(|| panic!("pool manager not configured"));
+            .ok_or(ContractError::PoolManagerNotConfigured)?;
 
         PoolManagerClient::new(&env, &pool_manager).apply_reserve_delta(&amount);
+        Ok(())
     }
 
     /// Protocol ping — extend with domain logic.
@@ -207,13 +239,14 @@ mod tests {
 
         let pool_addr = env.register_contract(None::<&Address>, PoolManager);
         env.as_contract(&pool_addr, || {
-            PoolManager::initialize(env.clone(), symbol_short!("admin"), 8_000);
-            PoolManager::deposit(env.clone(), symbol_short!("alice"), 100_000);
+            PoolManager::initialize(env.clone(), symbol_short!("admin"), 8_000).unwrap();
+            PoolManager::deposit(env.clone(), symbol_short!("alice"), 100_000).unwrap();
         });
 
         let waterfall_addr = env.register_contract(None::<&Address>, RepaymentWaterfall);
         env.as_contract(&waterfall_addr, || {
-            RepaymentWaterfall::initialize(env.clone(), symbol_short!("admin"), pool_addr.clone());
+            RepaymentWaterfall::initialize(env.clone(), symbol_short!("admin"), pool_addr.clone())
+                .unwrap();
         });
 
         (env, waterfall_addr, pool_addr)
@@ -224,7 +257,7 @@ mod tests {
         let (env, waterfall_addr, pool_addr) = setup();
 
         env.as_contract(&waterfall_addr, || {
-            RepaymentWaterfall::process_repayment(env.clone(), 5_000);
+            RepaymentWaterfall::process_repayment(env.clone(), 5_000).unwrap();
         });
 
         env.as_contract(&pool_addr, || {
@@ -233,12 +266,12 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "amount must be positive")]
     fn process_repayment_rejects_non_positive_amount() {
         let (env, waterfall_addr, _pool_addr) = setup();
-        env.as_contract(&waterfall_addr, || {
-            RepaymentWaterfall::process_repayment(env.clone(), 0);
+        let err = env.as_contract(&waterfall_addr, || {
+            RepaymentWaterfall::process_repayment(env.clone(), 0)
         });
+        assert_eq!(err, Err(ContractError::InvalidAmount));
     }
 }
 
@@ -327,7 +360,7 @@ mod split_tests {
             share_bps: 2_000, // 20%
         });
 
-        let results = RepaymentWaterfall::split_commitment(env.clone(), total_c, tiers);
+        let results = RepaymentWaterfall::split_commitment(env.clone(), total_c, tiers).unwrap();
         assert_eq!(results.len(), 2);
 
         let mut parts = Vec::new(&env);
@@ -361,7 +394,7 @@ mod split_tests {
             share_bps: 500, // 5%
         });
 
-        let results = RepaymentWaterfall::split_commitment(env.clone(), total_c, tiers);
+        let results = RepaymentWaterfall::split_commitment(env.clone(), total_c, tiers).unwrap();
         assert_eq!(results.len(), 3);
 
         let mut parts = Vec::new(&env);
@@ -377,8 +410,7 @@ mod split_tests {
     }
 
     #[test]
-    #[should_panic(expected = "shares must sum to exactly 10000 bps")]
-    fn test_split_invalid_bps_sum_panics() {
+    fn test_split_invalid_bps_sum_errors() {
         let env = setup();
         let total_c = test_commitment(100_000, 1234);
 
@@ -392,12 +424,14 @@ mod split_tests {
             share_bps: 1_999, // Sum is 9,999
         });
 
-        let _ = RepaymentWaterfall::split_commitment(env, total_c, tiers);
+        assert_eq!(
+            RepaymentWaterfall::split_commitment(env, total_c, tiers),
+            Err(ContractError::InvalidBpsSum)
+        );
     }
 
     #[test]
-    #[should_panic(expected = "tier share must be positive")]
-    fn test_split_zero_bps_panics() {
+    fn test_split_zero_bps_errors() {
         let env = setup();
         let total_c = test_commitment(100_000, 1234);
 
@@ -411,7 +445,10 @@ mod split_tests {
             share_bps: 0,
         });
 
-        let _ = RepaymentWaterfall::split_commitment(env, total_c, tiers);
+        assert_eq!(
+            RepaymentWaterfall::split_commitment(env, total_c, tiers),
+            Err(ContractError::InvalidTierShare)
+        );
     }
 
     #[test]

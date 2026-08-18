@@ -15,6 +15,8 @@
 //!
 //! No raw financial data is ever stored on-chain — only commitments.
 
+use crate::ContractError;
+
 /// Mersenne prime 2^127 − 1. This is exactly i128::MAX.
 const P: i128 = i128::MAX;
 
@@ -92,11 +94,13 @@ pub fn add_commitments(c1: i128, c2: i128) -> i128 {
 /// the total, we compute `commitment * share_bps / 10_000 (mod P)`.
 ///
 /// Note: this requires `scale` to have a modular inverse mod P.
-/// For basis-point splits (scale = 10_000), gcd(10_000, P) = 1 since P is prime.
-pub fn scale_commitment(c: i128, scalar: i128, scale: i128) -> i128 {
+/// For basis-point splits (scale = 10_000), gcd(10_000, P) = 1 since P is
+/// prime, so [`ContractError::ScaleNotInvertible`] can only be returned for
+/// a non-coprime scale.
+pub fn scale_commitment(c: i128, scalar: i128, scale: i128) -> Result<i128, ContractError> {
     let scaled = mod_mul(c, scalar, P);
-    let inv = mod_inverse(scale, P);
-    mod_mul(scaled, inv, P)
+    let inv = mod_inverse(scale, P)?;
+    Ok(mod_mul(scaled, inv, P))
 }
 
 /// Verify that a commitment matches a claimed `(value, blinding)` opening.
@@ -107,7 +111,7 @@ pub fn verify(commitment: i128, value: i128, blinding: i128) -> bool {
 }
 
 /// Extended Euclidean algorithm — returns modular inverse of `a` mod `m`.
-fn mod_inverse(a: i128, m: i128) -> i128 {
+fn mod_inverse(a: i128, m: i128) -> Result<i128, ContractError> {
     let a = a.rem_euclid(m);
     let (mut old_r, mut r) = (a, m);
     let (mut old_s, mut s) = (1_i128, 0_i128);
@@ -123,8 +127,10 @@ fn mod_inverse(a: i128, m: i128) -> i128 {
         old_s = tmp_s;
     }
 
-    assert!(old_r == 1, "no modular inverse exists");
-    old_s.rem_euclid(m)
+    if old_r != 1 {
+        return Err(ContractError::ScaleNotInvertible);
+    }
+    Ok(old_s.rem_euclid(m))
 }
 
 #[cfg(test)]
@@ -193,14 +199,14 @@ mod tests {
         let c = commit(v, r);
 
         // Scale by 3000/10000 = 30%
-        let scaled_c = scale_commitment(c, 3000, 10_000);
+        let scaled_c = scale_commitment(c, 3000, 10_000).unwrap();
         let _direct_c = commit(v * 3000 / 10_000, r * 3000 / 10_000);
 
         // Due to modular arithmetic, direct scaling of v and r won't match
         // the commitment scaling exactly (integer division truncation).
         // Instead verify the property: scale_commitment is deterministic
         // and consistent.
-        let scaled_c2 = scale_commitment(c, 3000, 10_000);
+        let scaled_c2 = scale_commitment(c, 3000, 10_000).unwrap();
         assert_eq!(scaled_c, scaled_c2);
     }
 
@@ -211,8 +217,8 @@ mod tests {
         let c = commit(v, r);
 
         // Split 60/40
-        let c_60 = scale_commitment(c, 6000, 10_000);
-        let c_40 = scale_commitment(c, 4000, 10_000);
+        let c_60 = scale_commitment(c, 6000, 10_000).unwrap();
+        let c_40 = scale_commitment(c, 4000, 10_000).unwrap();
         let c_sum = add_commitments(c_60, c_40);
 
         assert_eq!(c_sum, c);
@@ -229,7 +235,7 @@ mod tests {
 
     #[test]
     fn test_mod_inverse_correctness() {
-        let inv = mod_inverse(10_000, P);
+        let inv = mod_inverse(10_000, P).unwrap();
         let product = mod_mul(10_000, inv, P);
         assert_eq!(product, 1);
     }

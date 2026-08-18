@@ -6,7 +6,7 @@ use soroban_sdk::{
     Address, Env,
 };
 
-use crate::{Error, Governance, GovernanceClient, ProposalKind};
+use crate::{ContractError, Governance, GovernanceClient, ProposalKind};
 
 /// quorum 3_000 bps (30%), supermajority 6_600 bps (66%), 7-day voting window.
 const VOTING_PERIOD: u64 = 7 * 24 * 60 * 60;
@@ -41,7 +41,7 @@ fn initialize_twice_errors() {
     let other = Address::generate(&env);
     assert_eq!(
         client.try_initialize(&other, &VOTING_PERIOD, &QUORUM_BPS, &SUPERMAJORITY_BPS),
-        Err(Ok(Error::AlreadyInitialized))
+        Err(Ok(ContractError::AlreadyInitialized))
     );
 }
 
@@ -55,15 +55,14 @@ fn initialize_rejects_invalid_config() {
     // quorum of 0 is meaningless.
     assert_eq!(
         client.try_initialize(&admin, &VOTING_PERIOD, &0, &SUPERMAJORITY_BPS),
-        Err(Ok(Error::InvalidConfig))
+        Err(Ok(ContractError::InvalidConfig))
     );
     // a "supermajority" at or below a simple majority is a contradiction.
     assert_eq!(
         client.try_initialize(&admin, &VOTING_PERIOD, &QUORUM_BPS, &5_000),
-        Err(Ok(Error::InvalidConfig))
+        Err(Ok(ContractError::InvalidConfig))
     );
 }
-
 #[test]
 fn set_voting_power_sets_power_and_total() {
     let env = Env::default();
@@ -74,6 +73,19 @@ fn set_voting_power_sets_power_and_total() {
     client.set_voting_power(&alice, &100);
     assert_eq!(client.get_voting_power(&alice), 100);
     assert_eq!(client.total_voting_power(), 100);
+}
+
+#[test]
+fn set_voting_power_rejects_negative_power() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+    let alice = Address::generate(&env);
+
+    assert_eq!(
+        client.try_set_voting_power(&alice, &-1),
+        Err(Ok(ContractError::NegativePower))
+    );
 }
 
 #[test]
@@ -100,7 +112,7 @@ fn create_proposal_requires_voting_power() {
     let param = symbol_short!("max_util");
     assert_eq!(
         client.try_create_proposal(&outsider, &ProposalKind::Standard, &param, &9_000),
-        Err(Ok(Error::NoVotingPower))
+        Err(Ok(ContractError::NoVotingPower))
     );
 }
 
@@ -135,7 +147,7 @@ fn standard_proposal_auto_executes_on_majority_and_quorum() {
     // A late vote from bob after execution is rejected.
     assert_eq!(
         client.try_vote(&id, &bob, &true),
-        Err(Ok(Error::AlreadyFinalized))
+        Err(Ok(ContractError::AlreadyFinalized))
     );
 }
 
@@ -242,7 +254,7 @@ fn cannot_vote_twice_on_the_same_proposal() {
     client.vote(&id, &alice, &true);
     assert_eq!(
         client.try_vote(&id, &alice, &false),
-        Err(Ok(Error::AlreadyVoted))
+        Err(Ok(ContractError::AlreadyVoted))
     );
 }
 
@@ -261,7 +273,7 @@ fn cannot_vote_after_voting_window_closes() {
     advance_past_voting_end(&env);
     assert_eq!(
         client.try_vote(&id, &alice, &true),
-        Err(Ok(Error::VotingClosed))
+        Err(Ok(ContractError::VotingClosed))
     );
 }
 
@@ -278,7 +290,7 @@ fn execute_proposal_before_voting_end_errors() {
 
     assert_eq!(
         client.try_execute_proposal(&id),
-        Err(Ok(Error::VotingStillOpen))
+        Err(Ok(ContractError::VotingStillOpen))
     );
 }
 
@@ -308,7 +320,7 @@ fn get_proposal_missing_id_errors() {
     let (client, _admin) = setup(&env);
     assert_eq!(
         client.try_get_proposal(&999),
-        Err(Ok(Error::ProposalNotFound))
+        Err(Ok(ContractError::ProposalNotFound))
     );
 }
 

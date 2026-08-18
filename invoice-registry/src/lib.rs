@@ -8,7 +8,7 @@
 
 mod pedersen;
 
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Env, Symbol};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, symbol_short, Env, Symbol};
 
 // ─── Storage Keys ──────────────────────────────────────────────────────────
 
@@ -16,6 +16,28 @@ mod storage {
     use soroban_sdk::{symbol_short, Symbol};
 
     pub const ADMIN: Symbol = symbol_short!("admin");
+}
+
+/// Errors surfaced by the invoice registry. Stable `u32` discriminants so
+/// integrators and audit tooling can match on them.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum ContractError {
+    /// `initialize` called on an already-initialized contract.
+    AlreadyInitialized = 1,
+    /// An admin-guarded call was made before `initialize`.
+    NotInitialized = 2,
+    /// `register` was called with an id that already exists.
+    InvoiceAlreadyExists = 3,
+    /// The referenced invoice id does not exist.
+    InvoiceNotFound = 4,
+    /// The caller is not the admin.
+    Unauthorized = 5,
+    /// A lifecycle transition was attempted from the wrong status.
+    InvalidStatus = 6,
+    /// A commitment scale could not be inverted modulo P (not coprime).
+    ScaleNotInvertible = 7,
 }
 
 /// Per-invoice storage key.
@@ -65,13 +87,15 @@ pub struct InvoiceRegistry;
 impl InvoiceRegistry {
     /// One-time initialization. Sets the initial administrator.
     ///
-    /// Returns [`Error::AlreadyInitialized`] if the contract has already been
-    /// initialized, so the admin can never be silently overwritten.
-    pub fn initialize(env: Env, admin: Symbol) {
+    /// Returns [`ContractError::AlreadyInitialized`] if the contract has
+    /// already been initialized, so the admin can never be silently
+    /// overwritten.
+    pub fn initialize(env: Env, admin: Symbol) -> Result<(), ContractError> {
         if env.storage().instance().has(&storage::ADMIN) {
-            panic!("already initialized");
+            return Err(ContractError::AlreadyInitialized);
         }
         env.storage().instance().set(&storage::ADMIN, &admin);
+        Ok(())
     }
 
     // ── Invoice lifecycle ────────────────────────────────────────────────
@@ -81,10 +105,15 @@ impl InvoiceRegistry {
     /// The SME computes `commitment = pedersen::commit(amount, blinding)` off-chain
     /// and submits only the commitment. The plaintext amount and blinding factor
     /// remain secret.
-    pub fn register(env: Env, id: Symbol, commitment: i128, owner: Symbol) {
+    pub fn register(
+        env: Env,
+        id: Symbol,
+        commitment: i128,
+        owner: Symbol,
+    ) -> Result<(), ContractError> {
         let key = InvoiceKey(id.clone());
         if env.storage().persistent().has(&key) {
-            panic!("invoice already exists");
+            return Err(ContractError::InvoiceAlreadyExists);
         }
 
         let invoice = CommittedInvoice {
@@ -95,67 +124,73 @@ impl InvoiceRegistry {
         };
 
         env.storage().persistent().set(&key, &invoice);
+        Ok(())
     }
 
     /// Admin approves a pending invoice (Pending → Approved).
-    pub fn approve(env: Env, caller: Symbol, id: Symbol) {
-        Self::require_admin(&env, &caller);
+    pub fn approve(env: Env, caller: Symbol, id: Symbol) -> Result<(), ContractError> {
+        Self::require_admin(&env, &caller)?;
 
         let key = InvoiceKey(id);
         let mut invoice: CommittedInvoice = env
             .storage()
             .persistent()
             .get(&key)
-            .expect("invoice not found");
+            .ok_or(ContractError::InvoiceNotFound)?;
 
-        assert!(
-            invoice.status == InvoiceStatus::Pending,
-            "invoice must be Pending to approve"
-        );
+        if invoice.status != InvoiceStatus::Pending {
+            return Err(ContractError::InvalidStatus);
+        }
 
         invoice.status = InvoiceStatus::Approved;
         env.storage().persistent().set(&key, &invoice);
+        Ok(())
     }
 
     /// Admin assigns an approved invoice to a new owner / pool (Approved → Assigned).
-    pub fn assign(env: Env, caller: Symbol, id: Symbol, new_owner: Symbol) {
-        Self::require_admin(&env, &caller);
+    pub fn assign(
+        env: Env,
+        caller: Symbol,
+        id: Symbol,
+        new_owner: Symbol,
+    ) -> Result<(), ContractError> {
+        Self::require_admin(&env, &caller)?;
 
         let key = InvoiceKey(id);
         let mut invoice: CommittedInvoice = env
             .storage()
             .persistent()
             .get(&key)
-            .expect("invoice not found");
+            .ok_or(ContractError::InvoiceNotFound)?;
 
-        assert!(
-            invoice.status == InvoiceStatus::Approved,
-            "invoice must be Approved to assign"
-        );
+        if invoice.status != InvoiceStatus::Approved {
+            return Err(ContractError::InvalidStatus);
+        }
 
         invoice.status = InvoiceStatus::Assigned;
         invoice.owner = new_owner;
         env.storage().persistent().set(&key, &invoice);
+        Ok(())
     }
 
     /// Admin marks an assigned invoice as repaid (Assigned → Repaid).
-    pub fn mark_repaid(env: Env, caller: Symbol, id: Symbol) {
-        Self::require_admin(&env, &caller);
+    pub fn mark_repaid(env: Env, caller: Symbol, id: Symbol) -> Result<(), ContractError> {
+        Self::require_admin(&env, &caller)?;
 
         let key = InvoiceKey(id);
         let mut invoice: CommittedInvoice = env
             .storage()
             .persistent()
             .get(&key)
-            .expect("invoice not found");
+            .ok_or(ContractError::InvoiceNotFound)?;
 
-        assert!(
-            invoice.status == InvoiceStatus::Assigned,
-            "invoice must be Assigned to mark repaid"
-        );
+        if invoice.status != InvoiceStatus::Assigned {
+            return Err(ContractError::InvalidStatus);
+        }
 
         invoice.status = InvoiceStatus::Repaid;
         env.storage().persistent().set(&key, &invoice);
+        Ok(())
     }
 
     // ── Queries ──────────────────────────────────────────────────────────
@@ -170,14 +205,19 @@ impl InvoiceRegistry {
     ///
     /// This allows an SME to reveal their amount to an auditor/buyer without
     /// ever storing the plaintext on-chain.
-    pub fn verify_amount(env: Env, id: Symbol, value: i128, blinding: i128) -> bool {
+    pub fn verify_amount(
+        env: Env,
+        id: Symbol,
+        value: i128,
+        blinding: i128,
+    ) -> Result<bool, ContractError> {
         let invoice: CommittedInvoice = env
             .storage()
             .persistent()
             .get(&InvoiceKey(id))
-            .expect("invoice not found");
+            .ok_or(ContractError::InvoiceNotFound)?;
 
-        pedersen::verify(invoice.commitment, value, blinding)
+        Ok(pedersen::verify(invoice.commitment, value, blinding))
     }
 
     /// Protocol ping — extend with domain logic.
@@ -193,13 +233,16 @@ impl InvoiceRegistry {
 
     // ── Internal helpers ─────────────────────────────────────────────────
 
-    fn require_admin(env: &Env, caller: &Symbol) {
+    fn require_admin(env: &Env, caller: &Symbol) -> Result<(), ContractError> {
         let admin: Symbol = env
             .storage()
             .instance()
             .get(&storage::ADMIN)
-            .expect("not initialized");
-        assert!(*caller == admin, "only admin");
+            .ok_or(ContractError::NotInitialized)?;
+        if *caller != admin {
+            return Err(ContractError::Unauthorized);
+        }
+        Ok(())
     }
 }
 
@@ -269,7 +312,7 @@ mod tests {
         env.mock_all_auths();
         let contract_addr = env.register_contract(None::<&Address>, InvoiceRegistry);
         env.as_contract(&contract_addr, || {
-            InvoiceRegistry::initialize(env.clone(), symbol_short!("admin"));
+            InvoiceRegistry::initialize(env.clone(), symbol_short!("admin")).unwrap();
         });
         (env, contract_addr)
     }
@@ -292,7 +335,8 @@ mod tests {
                 inv_id.clone(),
                 commitment,
                 symbol_short!("sme1"),
-            );
+            )
+            .unwrap();
         });
 
         let invoice = env.as_contract(&contract_addr, || {
@@ -305,26 +349,27 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "invoice already exists")]
-    fn test_register_duplicate_panics() {
+    fn test_register_duplicate_errors() {
         let (env, contract_addr) = setup();
         let inv_id = symbol_short!("INV002");
         let commitment = test_commitment(10_000, 999);
 
-        env.as_contract(&contract_addr, || {
+        let err = env.as_contract(&contract_addr, || {
             InvoiceRegistry::register(
                 env.clone(),
                 inv_id.clone(),
                 commitment,
                 symbol_short!("sme1"),
-            );
+            )
+            .unwrap();
             InvoiceRegistry::register(
                 env.clone(),
                 inv_id.clone(),
                 commitment,
                 symbol_short!("sme1"),
-            );
+            )
         });
+        assert_eq!(err, Err(ContractError::InvoiceAlreadyExists));
     }
 
     // ── Approval ─────────────────────────────────────────────────────────
@@ -341,8 +386,9 @@ mod tests {
                 inv_id.clone(),
                 commitment,
                 symbol_short!("sme1"),
-            );
-            InvoiceRegistry::approve(env.clone(), symbol_short!("admin"), inv_id.clone());
+            )
+            .unwrap();
+            InvoiceRegistry::approve(env.clone(), symbol_short!("admin"), inv_id.clone()).unwrap();
         });
 
         let invoice = env.as_contract(&contract_addr, || {
@@ -352,21 +398,22 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "only admin")]
-    fn test_approve_non_admin_panics() {
+    fn test_approve_non_admin_errors() {
         let (env, contract_addr) = setup();
         let inv_id = symbol_short!("INV004");
         let commitment = test_commitment(30_000, 777);
 
-        env.as_contract(&contract_addr, || {
+        let err = env.as_contract(&contract_addr, || {
             InvoiceRegistry::register(
                 env.clone(),
                 inv_id.clone(),
                 commitment,
                 symbol_short!("sme1"),
-            );
-            InvoiceRegistry::approve(env.clone(), symbol_short!("hacker"), inv_id);
+            )
+            .unwrap();
+            InvoiceRegistry::approve(env.clone(), symbol_short!("hacker"), inv_id)
         });
+        assert_eq!(err, Err(ContractError::Unauthorized));
     }
 
     // ── Assignment ───────────────────────────────────────────────────────
@@ -383,14 +430,16 @@ mod tests {
                 inv_id.clone(),
                 commitment,
                 symbol_short!("sme1"),
-            );
-            InvoiceRegistry::approve(env.clone(), symbol_short!("admin"), inv_id.clone());
+            )
+            .unwrap();
+            InvoiceRegistry::approve(env.clone(), symbol_short!("admin"), inv_id.clone()).unwrap();
             InvoiceRegistry::assign(
                 env.clone(),
                 symbol_short!("admin"),
                 inv_id.clone(),
                 symbol_short!("pool1"),
-            );
+            )
+            .unwrap();
         });
 
         let invoice = env.as_contract(&contract_addr, || {
@@ -414,15 +463,18 @@ mod tests {
                 inv_id.clone(),
                 commitment,
                 symbol_short!("sme1"),
-            );
-            InvoiceRegistry::approve(env.clone(), symbol_short!("admin"), inv_id.clone());
+            )
+            .unwrap();
+            InvoiceRegistry::approve(env.clone(), symbol_short!("admin"), inv_id.clone()).unwrap();
             InvoiceRegistry::assign(
                 env.clone(),
                 symbol_short!("admin"),
                 inv_id.clone(),
                 symbol_short!("pool1"),
-            );
-            InvoiceRegistry::mark_repaid(env.clone(), symbol_short!("admin"), inv_id.clone());
+            )
+            .unwrap();
+            InvoiceRegistry::mark_repaid(env.clone(), symbol_short!("admin"), inv_id.clone())
+                .unwrap();
         });
 
         let invoice = env.as_contract(&contract_addr, || {
@@ -447,11 +499,12 @@ mod tests {
                 inv_id.clone(),
                 commitment,
                 symbol_short!("sme1"),
-            );
+            )
+            .unwrap();
         });
 
         let verified = env.as_contract(&contract_addr, || {
-            InvoiceRegistry::verify_amount(env.clone(), inv_id, value, blinding)
+            InvoiceRegistry::verify_amount(env.clone(), inv_id, value, blinding).unwrap()
         });
         assert!(verified);
     }
@@ -468,11 +521,12 @@ mod tests {
                 inv_id.clone(),
                 commitment,
                 symbol_short!("sme1"),
-            );
+            )
+            .unwrap();
         });
 
         let verified = env.as_contract(&contract_addr, || {
-            InvoiceRegistry::verify_amount(env.clone(), inv_id, 99_999, 13579)
+            InvoiceRegistry::verify_amount(env.clone(), inv_id, 99_999, 13579).unwrap()
         });
         assert!(!verified);
     }
@@ -510,7 +564,8 @@ mod tests {
                 inv_id.clone(),
                 commitment,
                 symbol_short!("sme1"),
-            );
+            )
+            .unwrap();
             assert_eq!(
                 InvoiceRegistry::get_invoice(env.clone(), inv_id.clone())
                     .unwrap()
@@ -519,7 +574,7 @@ mod tests {
             );
 
             // Approve
-            InvoiceRegistry::approve(env.clone(), symbol_short!("admin"), inv_id.clone());
+            InvoiceRegistry::approve(env.clone(), symbol_short!("admin"), inv_id.clone()).unwrap();
             assert_eq!(
                 InvoiceRegistry::get_invoice(env.clone(), inv_id.clone())
                     .unwrap()
@@ -533,7 +588,8 @@ mod tests {
                 symbol_short!("admin"),
                 inv_id.clone(),
                 symbol_short!("pool1"),
-            );
+            )
+            .unwrap();
             assert_eq!(
                 InvoiceRegistry::get_invoice(env.clone(), inv_id.clone())
                     .unwrap()
@@ -542,7 +598,8 @@ mod tests {
             );
 
             // Mark repaid
-            InvoiceRegistry::mark_repaid(env.clone(), symbol_short!("admin"), inv_id.clone());
+            InvoiceRegistry::mark_repaid(env.clone(), symbol_short!("admin"), inv_id.clone())
+                .unwrap();
             assert_eq!(
                 InvoiceRegistry::get_invoice(env.clone(), inv_id.clone())
                     .unwrap()
@@ -551,12 +608,7 @@ mod tests {
             );
 
             // Verify amount at any stage
-            assert!(InvoiceRegistry::verify_amount(
-                env.clone(),
-                inv_id,
-                value,
-                blinding
-            ));
+            assert!(InvoiceRegistry::verify_amount(env.clone(), inv_id, value, blinding).unwrap());
         });
     }
 }
