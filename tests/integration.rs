@@ -1,7 +1,7 @@
 use invoice_registry::{InvoiceRegistry, InvoiceRegistryClient};
 use pool_manager::{PoolManager, PoolManagerClient};
 use repayment_waterfall::{RepaymentWaterfall, RepaymentWaterfallClient};
-use soroban_sdk::{symbol_short, testutils::Address as _, Address, Env};
+use soroban_sdk::{symbol_short, Address, Env};
 
 /// Deploys `invoice-registry`, `pool-manager`, and `repayment-waterfall` into
 /// one `Env` and initializes them, wiring `repayment-waterfall` to the
@@ -15,7 +15,7 @@ fn deploy_all(env: &Env) -> (InvoiceRegistryClient<'_>, PoolManagerClient<'_>, R
     let pool = PoolManagerClient::new(env, &pool_id);
     let waterfall = RepaymentWaterfallClient::new(env, &waterfall_id);
 
-    registry.initialize(&Address::generate(env));
+    registry.initialize(&symbol_short!("admin"));
     pool.initialize(&symbol_short!("admin"), &8_000);
     waterfall.initialize(&symbol_short!("admin"), &pool_id);
 
@@ -28,9 +28,13 @@ fn deploys_all_three_contracts_in_the_same_env() {
     env.mock_all_auths();
     let (registry, pool, waterfall) = deploy_all(&env);
 
-    assert_eq!(registry.version(), 1);
+    // invoice-registry and repayment-waterfall are both at version 2 as of
+    // 2e33234 ("implement confidential invoice amounts using homomorphic
+    // commitments") — pool-manager wasn't touched by that change, so it's
+    // still 1. This test previously hardcoded stale pre-bump values.
+    assert_eq!(registry.version(), 2);
     assert_eq!(pool.version(), 1);
-    assert_eq!(waterfall.version(), 1);
+    assert_eq!(waterfall.version(), 2);
 }
 
 /// Happy-path cross-contract flow: an SME's invoice is acknowledged by the
