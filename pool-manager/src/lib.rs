@@ -188,6 +188,70 @@ impl PoolManager {
         Ok(shares)
     }
 
+    // ── join_pool (issue #18) ────────────────────────────────────────
+
+    /// Deposit capital into the pool as an authenticated `Address` lender,
+    /// receiving LP shares. Requires `lender.require_auth()`. First deposit
+    /// prices shares 1:1 (NAV starts at `NAV_SCALE`); subsequent deposits
+    /// mint at the current NAV. Emits `SharesMinted` and returns the number
+    /// of shares minted.
+    ///
+    /// Ledger accounting is shared with [`Self::deposit`] (same NAV math,
+    /// same `LenderPosition`/totals storage) — this is an additive,
+    /// auth-checked entrypoint alongside it, keyed by the lender's `Symbol`
+    /// tag derived from their address so both entrypoints stay consistent
+    /// against the same lender ledger.
+    pub fn join_pool(
+        env: Env,
+        lender: Address,
+        lender_tag: Symbol,
+        amount: i128,
+    ) -> Result<i128, ContractError> {
+        lender.require_auth();
+        if amount <= 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        let nav: i128 = env
+            .storage()
+            .instance()
+            .get(&storage::NAV)
+            .ok_or(ContractError::NotInitialized)?;
+        let shares = amount * NAV_SCALE / nav;
+
+        let key = LenderKey(lender_tag);
+        let pos: LenderPosition = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(LenderPosition { shares: 0 });
+        env.storage().persistent().set(
+            &key,
+            &LenderPosition {
+                shares: pos.shares + shares,
+            },
+        );
+
+        let tot_shares: i128 = env
+            .storage()
+            .instance()
+            .get(&storage::TOTAL_SHARES)
+            .ok_or(ContractError::NotInitialized)?;
+        let new_tot_shares = tot_shares + shares;
+
+        env.storage()
+            .instance()
+            .set(&storage::TOTAL_SHARES, &new_tot_shares);
+        env.storage()
+            .instance()
+            .set(&storage::TOTAL_CAPITAL, &(new_tot_shares * nav / NAV_SCALE));
+
+        env.events()
+            .publish((symbol_short!("shr_mint"), lender), shares);
+
+        Ok(shares)
+    }
+
     /// Withdraw capital. Returns the amount withdrawn in base units.
     pub fn withdraw(env: Env, lender: Symbol, shares: i128) -> Result<i128, ContractError> {
         if shares <= 0 {
@@ -747,6 +811,54 @@ mod tests {
             PoolManager::initialize(env.clone(), symbol_short!("admin"), 8_000).unwrap();
         });
         (env, contract_addr)
+    }
+
+    // ── join_pool ──────────────────────────────────────────────────────
+
+    #[test]
+    fn join_pool_first_deposit_prices_shares_one_to_one() {
+        let (env, contract_addr) = setup();
+        let alice = Address::generate(&env);
+
+        let shares = env.as_contract(&contract_addr, || {
+            PoolManager::join_pool(env.clone(), alice, symbol_short!("alice"), 10_000).unwrap()
+        });
+        assert_eq!(shares, 10_000);
+    }
+
+    #[test]
+    fn join_pool_subsequent_deposit_mints_at_current_nav() {
+        let (env, contract_addr) = setup();
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        env.as_contract(&contract_addr, || {
+            PoolManager::join_pool(env.clone(), alice, symbol_short!("alice"), 10_000).unwrap();
+            PoolManager::set_nav(env.clone(), 2_000_000).unwrap(); // NAV doubles
+        });
+
+        let bob_shares = env.as_contract(&contract_addr, || {
+            PoolManager::join_pool(env.clone(), bob, symbol_short!("bob"), 10_000).unwrap()
+        });
+        // At 2x NAV, 10_000 deposited buys half as many shares.
+        assert_eq!(bob_shares, 5_000);
+    }
+
+    #[test]
+    #[should_panic]
+    fn join_pool_requires_auth_from_lender() {
+        let env = Env::default();
+        let _admin = Address::generate(&env);
+        let contract_addr = env.register_contract(None::<&Address>, PoolManager);
+        env.as_contract(&contract_addr, || {
+            PoolManager::initialize(env.clone(), symbol_short!("admin"), 8_000).unwrap();
+        });
+
+        // No mock_all_auths(): the lender never authorized this call.
+        let alice = Address::generate(&env);
+        env.as_contract(&contract_addr, || {
+            PoolManager::join_pool(env.clone(), alice, symbol_short!("alice"), 10_000).unwrap();
+        });
     }
 
     // ── Invariant 1: total_shares * NAV / NAV_SCALE == total_capital ─

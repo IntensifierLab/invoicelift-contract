@@ -118,9 +118,29 @@ pub struct WaterfallResult {
     pub commitment: i128,
 }
 
+/// Tracks default volume accumulated within the current rolling 24h window
+/// used by the circuit breaker (see `record_default`).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DefaultRecord {
+    pub window_start: u64,
+    pub volume: i128,
+}
+
 use soroban_sdk::{contractclient, Address};
 
 const POOL_MANAGER: Symbol = symbol_short!("pool_mgr");
+
+/// Storage key for the current rolling-window `DefaultRecord`.
+const DEFAULT_RECORD: Symbol = symbol_short!("dflt_rec");
+/// Storage key for the configured circuit-breaker default-volume threshold.
+const CB_THRESHOLD: Symbol = symbol_short!("cb_thresh");
+/// Storage key for the circuit-breaker tripped flag.
+const CB_ACTIVE: Symbol = symbol_short!("cb_active");
+
+/// Length of the rolling default-volume window, in seconds (24h), mirroring
+/// the `env.ledger().timestamp()` idiom used for pool-manager's timelock.
+const CIRCUIT_BREAKER_WINDOW_SECS: u64 = 86_400;
 
 /// Minimal cross-contract interface onto `pool-manager`'s reserve-delta entry
 /// point. Declared locally (rather than depending on the `pool-manager` crate
@@ -156,11 +176,13 @@ impl RepaymentWaterfall {
     /// Split a total confidential commitment across multiple tiers according to basis points.
     /// The sum of the split commitments is guaranteed to match the total commitment homomorphically.
     pub fn split_commitment(
-        _env: Env,
+        env: Env,
         total_commitment: i128,
         tiers: Vec<WaterfallTier>,
     ) -> Result<Vec<WaterfallResult>, ContractError> {
-        let mut results = Vec::new(&_env);
+        Self::require_not_paused(&env);
+
+        let mut results = Vec::new(&env);
         let mut sum_bps: i128 = 0;
 
         for tier in tiers.iter() {
@@ -201,6 +223,7 @@ impl RepaymentWaterfall {
     /// storage writes already made) if pool-manager rejects it — e.g. if the
     /// repayment would leave the pool with negative capital.
     pub fn process_repayment(env: Env, amount: i128) -> Result<(), ContractError> {
+        Self::require_not_paused(&env);
         if amount <= 0 {
             return Err(ContractError::InvalidAmount);
         }
@@ -225,6 +248,106 @@ impl RepaymentWaterfall {
     pub fn version(_env: Env) -> u32 {
         2
     }
+
+    // ── circuit breaker: default surge protection ──────────────────────
+
+    /// Records a default of `amount` against the rolling 24h default-volume
+    /// window. Integration point: this is intended to be invoked whenever a
+    /// default occurs — plausibly by `pool-manager` (once it tracks default
+    /// state) or by an off-chain monitoring/liquidation job — so the
+    /// waterfall can react to a surge in defaults independent of any single
+    /// invoice's own lifecycle. Resets the window (`window_start` = now,
+    /// `volume` = `amount`) if 24h (`CIRCUIT_BREAKER_WINDOW_SECS`) have
+    /// elapsed since the window began, otherwise accumulates `amount` into
+    /// the existing window's `volume`. If the resulting volume meets or
+    /// exceeds the configured threshold, trips the circuit breaker: sets the
+    /// `CircuitBreakerActive` flag and emits `CircuitBreakerTripped`
+    /// (topic `cb_trip`, data `(volume, threshold)`).
+    pub fn record_default(env: Env, amount: i128) {
+        assert!(amount > 0, "amount must be positive");
+
+        let now = env.ledger().timestamp();
+        let mut record: DefaultRecord =
+            env.storage()
+                .instance()
+                .get(&DEFAULT_RECORD)
+                .unwrap_or(DefaultRecord {
+                    window_start: now,
+                    volume: 0,
+                });
+
+        if now.saturating_sub(record.window_start) >= CIRCUIT_BREAKER_WINDOW_SECS {
+            record.window_start = now;
+            record.volume = amount;
+        } else {
+            record.volume += amount;
+        }
+
+        env.storage().instance().set(&DEFAULT_RECORD, &record);
+
+        let threshold: i128 = env.storage().instance().get(&CB_THRESHOLD).unwrap_or(0);
+
+        if threshold > 0 && record.volume >= threshold {
+            env.storage().instance().set(&CB_ACTIVE, &true);
+            env.events()
+                .publish((symbol_short!("cb_trip"),), (record.volume, threshold));
+        }
+    }
+
+    /// Admin-gated. Sets the rolling 24h default-volume threshold above
+    /// which `record_default` trips the circuit breaker.
+    pub fn set_circuit_breaker_threshold(env: Env, admin: Symbol, threshold: i128) {
+        Self::require_admin(&env, &admin);
+        assert!(threshold > 0, "threshold must be positive");
+        env.storage().instance().set(&CB_THRESHOLD, &threshold);
+    }
+
+    /// Admin-gated. Resumes processing after a circuit breaker trip has been
+    /// reviewed, clearing `CircuitBreakerActive` and resetting the rolling
+    /// default-volume window.
+    pub fn resume_processing(env: Env, admin: Symbol) {
+        Self::require_admin(&env, &admin);
+        env.storage().instance().set(&CB_ACTIVE, &false);
+        env.storage().instance().set(
+            &DEFAULT_RECORD,
+            &DefaultRecord {
+                window_start: env.ledger().timestamp(),
+                volume: 0,
+            },
+        );
+    }
+
+    /// Whether the circuit breaker is currently tripped.
+    pub fn circuit_breaker_active(env: Env) -> bool {
+        env.storage().instance().get(&CB_ACTIVE).unwrap_or(false)
+    }
+
+    /// The default volume accumulated in the current rolling 24h window.
+    pub fn current_default_volume(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get::<Symbol, DefaultRecord>(&DEFAULT_RECORD)
+            .map(|r| r.volume)
+            .unwrap_or(0)
+    }
+
+    /// Panics if the circuit breaker is currently tripped. Called at the top
+    /// of every repayment-processing entry point (`split_commitment`,
+    /// `process_repayment`) so a trip pauses all repayment-waterfall
+    /// processing.
+    fn require_not_paused(env: &Env) {
+        let active: bool = env.storage().instance().get(&CB_ACTIVE).unwrap_or(false);
+        assert!(!active, "circuit breaker active: processing paused");
+    }
+
+    fn require_admin(env: &Env, caller: &Symbol) {
+        let admin: Symbol = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("admin"))
+            .expect("not initialized");
+        assert!(*caller == admin, "only admin");
+    }
 }
 
 #[cfg(test)]
@@ -232,6 +355,7 @@ mod tests {
     use super::*;
     use pool_manager::PoolManager;
     use soroban_sdk::symbol_short;
+    use soroban_sdk::testutils::Ledger;
 
     fn setup() -> (Env, Address, Address) {
         let env = Env::default();
@@ -272,6 +396,110 @@ mod tests {
             RepaymentWaterfall::process_repayment(env.clone(), 0)
         });
         assert_eq!(err, Err(ContractError::InvalidAmount));
+    }
+
+    // ── circuit breaker: default surge protection ──────────────────────
+
+    #[test]
+    fn record_default_accumulates_within_window() {
+        let (env, waterfall_addr, _pool_addr) = setup();
+
+        env.as_contract(&waterfall_addr, || {
+            RepaymentWaterfall::record_default(env.clone(), 1_000);
+            RepaymentWaterfall::record_default(env.clone(), 2_000);
+            assert_eq!(RepaymentWaterfall::current_default_volume(env.clone()), 3_000);
+            assert!(!RepaymentWaterfall::circuit_breaker_active(env.clone()));
+        });
+    }
+
+    #[test]
+    fn record_default_resets_after_24h() {
+        let (env, waterfall_addr, _pool_addr) = setup();
+
+        env.as_contract(&waterfall_addr, || {
+            RepaymentWaterfall::record_default(env.clone(), 1_000);
+        });
+
+        env.ledger().with_mut(|li| li.timestamp += 86_400);
+
+        env.as_contract(&waterfall_addr, || {
+            RepaymentWaterfall::record_default(env.clone(), 500);
+            assert_eq!(RepaymentWaterfall::current_default_volume(env.clone()), 500);
+        });
+    }
+
+    #[test]
+    fn circuit_breaker_trips_at_threshold() {
+        let (env, waterfall_addr, _pool_addr) = setup();
+
+        env.as_contract(&waterfall_addr, || {
+            RepaymentWaterfall::set_circuit_breaker_threshold(
+                env.clone(),
+                symbol_short!("admin"),
+                5_000,
+            );
+            assert!(!RepaymentWaterfall::circuit_breaker_active(env.clone()));
+
+            RepaymentWaterfall::record_default(env.clone(), 5_000);
+            assert!(RepaymentWaterfall::circuit_breaker_active(env.clone()));
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "circuit breaker active: processing paused")]
+    fn processing_blocked_while_circuit_breaker_tripped() {
+        let (env, waterfall_addr, _pool_addr) = setup();
+
+        env.as_contract(&waterfall_addr, || {
+            RepaymentWaterfall::set_circuit_breaker_threshold(
+                env.clone(),
+                symbol_short!("admin"),
+                1_000,
+            );
+            RepaymentWaterfall::record_default(env.clone(), 1_000);
+            let _ = RepaymentWaterfall::process_repayment(env.clone(), 100);
+        });
+    }
+
+    #[test]
+    fn admin_can_resume_processing_after_trip() {
+        let (env, waterfall_addr, pool_addr) = setup();
+
+        env.as_contract(&waterfall_addr, || {
+            RepaymentWaterfall::set_circuit_breaker_threshold(
+                env.clone(),
+                symbol_short!("admin"),
+                1_000,
+            );
+            RepaymentWaterfall::record_default(env.clone(), 1_000);
+            assert!(RepaymentWaterfall::circuit_breaker_active(env.clone()));
+
+            RepaymentWaterfall::resume_processing(env.clone(), symbol_short!("admin"));
+            assert!(!RepaymentWaterfall::circuit_breaker_active(env.clone()));
+            assert_eq!(RepaymentWaterfall::current_default_volume(env.clone()), 0);
+
+            RepaymentWaterfall::process_repayment(env.clone(), 100).unwrap();
+        });
+
+        env.as_contract(&pool_addr, || {
+            assert_eq!(PoolManager::total_capital(env.clone()), 100_100);
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "only admin")]
+    fn non_admin_resume_is_rejected() {
+        let (env, waterfall_addr, _pool_addr) = setup();
+
+        env.as_contract(&waterfall_addr, || {
+            RepaymentWaterfall::set_circuit_breaker_threshold(
+                env.clone(),
+                symbol_short!("admin"),
+                1_000,
+            );
+            RepaymentWaterfall::record_default(env.clone(), 1_000);
+            RepaymentWaterfall::resume_processing(env.clone(), symbol_short!("not_admin"));
+        });
     }
 }
 
@@ -332,10 +560,15 @@ mod split_tests {
     use super::*;
     use soroban_sdk::{symbol_short, Env};
 
-    fn setup() -> Env {
+    fn setup() -> (Env, Address) {
         let env = Env::default();
         env.mock_all_auths();
-        env
+        // A registered (but uninitialized) contract instance so calls that
+        // touch instance storage (e.g. `require_not_paused`'s circuit-breaker
+        // check) have a real invocation context to read from, matching how
+        // Soroban actually invokes contracts in production.
+        let addr = env.register_contract(None::<&Address>, RepaymentWaterfall);
+        (env, addr)
     }
 
     fn test_commitment(value: i128, blinding: i128) -> i128 {
@@ -347,7 +580,7 @@ mod split_tests {
 
     #[test]
     fn test_split_commitment_two_tiers_sums_correctly() {
-        let env = setup();
+        let (env, addr) = setup();
         let total_c = test_commitment(100_000, 1234);
 
         let mut tiers = Vec::new(&env);
@@ -360,7 +593,11 @@ mod split_tests {
             share_bps: 2_000, // 20%
         });
 
-        let results = RepaymentWaterfall::split_commitment(env.clone(), total_c, tiers).unwrap();
+        let results = env
+            .as_contract(&addr, || {
+                RepaymentWaterfall::split_commitment(env.clone(), total_c, tiers)
+            })
+            .unwrap();
         assert_eq!(results.len(), 2);
 
         let mut parts = Vec::new(&env);
@@ -377,7 +614,7 @@ mod split_tests {
 
     #[test]
     fn test_split_commitment_three_tiers_sums_correctly() {
-        let env = setup();
+        let (env, addr) = setup();
         let total_c = test_commitment(250_000, 9999);
 
         let mut tiers = Vec::new(&env);
@@ -394,7 +631,11 @@ mod split_tests {
             share_bps: 500, // 5%
         });
 
-        let results = RepaymentWaterfall::split_commitment(env.clone(), total_c, tiers).unwrap();
+        let results = env
+            .as_contract(&addr, || {
+                RepaymentWaterfall::split_commitment(env.clone(), total_c, tiers)
+            })
+            .unwrap();
         assert_eq!(results.len(), 3);
 
         let mut parts = Vec::new(&env);
@@ -411,7 +652,7 @@ mod split_tests {
 
     #[test]
     fn test_split_invalid_bps_sum_errors() {
-        let env = setup();
+        let (env, addr) = setup();
         let total_c = test_commitment(100_000, 1234);
 
         let mut tiers = Vec::new(&env);
@@ -424,15 +665,15 @@ mod split_tests {
             share_bps: 1_999, // Sum is 9,999
         });
 
-        assert_eq!(
-            RepaymentWaterfall::split_commitment(env, total_c, tiers),
-            Err(ContractError::InvalidBpsSum)
-        );
+        let result = env.as_contract(&addr, || {
+            RepaymentWaterfall::split_commitment(env.clone(), total_c, tiers)
+        });
+        assert_eq!(result, Err(ContractError::InvalidBpsSum));
     }
 
     #[test]
     fn test_split_zero_bps_errors() {
-        let env = setup();
+        let (env, addr) = setup();
         let total_c = test_commitment(100_000, 1234);
 
         let mut tiers = Vec::new(&env);
@@ -445,15 +686,15 @@ mod split_tests {
             share_bps: 0,
         });
 
-        assert_eq!(
-            RepaymentWaterfall::split_commitment(env, total_c, tiers),
-            Err(ContractError::InvalidTierShare)
-        );
+        let result = env.as_contract(&addr, || {
+            RepaymentWaterfall::split_commitment(env.clone(), total_c, tiers)
+        });
+        assert_eq!(result, Err(ContractError::InvalidTierShare));
     }
 
     #[test]
     fn test_verify_split_tampered_fails() {
-        let env = setup();
+        let (env, _addr) = setup();
         let total_c = test_commitment(100_000, 1234);
 
         let mut parts = Vec::new(&env);
