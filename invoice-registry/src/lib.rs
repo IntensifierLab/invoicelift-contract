@@ -6,11 +6,14 @@
 //! are ever written on-chain. Only parties holding the opening `(value, blinding)`
 //! can verify (or prove to an auditor) the original amount.
 
+mod nft;
 mod pedersen;
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Symbol,
 };
+
+pub use nft::TransferRecord;
 
 // ─── Storage Keys ──────────────────────────────────────────────────────────
 
@@ -355,6 +358,61 @@ impl InvoiceRegistry {
             return Err(ContractError::Unauthorized);
         }
         Ok(())
+    }
+}
+
+// ── Invoice NFT tokenisation ────────────────────────────────────────────
+//
+// A separate `impl` block (rather than more methods on the block above) so
+// this addition doesn't need to touch the existing entrypoints' region at
+// all - see `nft` for the full design (token model, royalty-hook,
+// single-owner repayment-share simplification).
+#[contractimpl]
+impl InvoiceRegistry {
+    /// Mint the token for `token_id` (typically an invoice id, called once
+    /// it's financed) with `owner` as its initial owner. Admin-gated.
+    pub fn mint_invoice_token(
+        env: Env,
+        caller: Symbol,
+        token_id: Symbol,
+        owner: Symbol,
+    ) -> Result<(), ContractError> {
+        Self::require_admin(&env, &caller)?;
+        nft::mint(&env, token_id, owner);
+        Ok(())
+    }
+
+    /// Transfer `token_id` from `from` to `to`, recording the transfer
+    /// on-chain and publishing a royalty-hook event. `from` must be the
+    /// token's current owner.
+    pub fn transfer_invoice_token(
+        env: Env,
+        token_id: Symbol,
+        from: Symbol,
+        to: Symbol,
+        royalty_bps: u32,
+    ) {
+        nft::transfer(&env, token_id, from, to, royalty_bps);
+    }
+
+    /// Current owner of `token_id`, or `None` if it hasn't been minted.
+    pub fn invoice_owner(env: Env, token_id: Symbol) -> Option<Symbol> {
+        nft::owner_of(&env, token_id)
+    }
+
+    /// Full on-chain transfer history for `token_id`.
+    pub fn invoice_transfer_history(env: Env, token_id: Symbol) -> soroban_sdk::Vec<TransferRecord> {
+        nft::transfer_history(&env, token_id)
+    }
+
+    /// The current owner's share of `total_repayment` (single-owner model —
+    /// see `nft` module docs).
+    pub fn invoice_repayment_share(
+        env: Env,
+        token_id: Symbol,
+        total_repayment: i128,
+    ) -> (Symbol, i128) {
+        nft::repayment_share(&env, token_id, total_repayment)
     }
 }
 
