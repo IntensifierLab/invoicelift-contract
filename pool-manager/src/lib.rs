@@ -22,6 +22,15 @@ mod storage {
     pub const ADMIN_ADDR: Symbol = symbol_short!("adm_addr");
     /// Next id to assign to a queued timelocked action.
     pub const NEXT_ACTION: Symbol = symbol_short!("nxt_act");
+
+    // ── Pool creation config (issue #17) ────────────────────────────────
+    /// Whether `create_pool` has already been called (guards duplicate config).
+    pub const POOL_CFG_SET: Symbol = symbol_short!("pl_cfg");
+    pub const BUYER_LIMIT_BPS: Symbol = symbol_short!("buy_lim");
+    pub const SME_LIMIT_BPS: Symbol = symbol_short!("sme_lim");
+    pub const MIN_DEPOSIT: Symbol = symbol_short!("min_dep");
+    pub const MAX_DEPOSIT: Symbol = symbol_short!("max_dep");
+    pub const RESERVE_RATIO_BPS: Symbol = symbol_short!("rsv_rat");
 }
 
 /// Errors surfaced by the pool manager. Stable `u32` discriminants so
@@ -64,6 +73,14 @@ pub enum ContractError {
     TimelockNotElapsed = 16,
     /// A queued change referenced an unknown parameter name.
     UnknownParameter = 17,
+    /// `create_pool` called before `initialize`.
+    PoolNotInitialized = 18,
+    /// `create_pool` called more than once.
+    PoolAlreadyCreated = 19,
+    /// A concentration/reserve bps parameter was outside `(0, BPS_SCALE]`.
+    InvalidBps = 20,
+    /// `min_deposit` was not strictly positive, or exceeded `max_deposit`.
+    InvalidDepositRange = 21,
 }
 
 /// Reserve coverage floor, in basis points (500 = 5%). Rebalancing targets keeping
@@ -137,6 +154,99 @@ impl PoolManager {
             .set(&storage::MAX_UTIL, &max_utilisation);
         env.storage().instance().set(&storage::NAV, &NAV_SCALE);
         Ok(())
+    }
+
+    // ── Pool creation config (issue #17) ────────────────────────────────
+
+    /// Configures per-buyer / per-SME concentration limits and deposit/reserve
+    /// parameters for this pool. Callable once, after `initialize`. Errors
+    /// if the pool wasn't initialized yet, or if configuration was already
+    /// set (mirrors "duplicate pool IDs rejected" for this single-pool
+    /// contract instance). Emits `PoolCreated`.
+    pub fn create_pool(
+        env: Env,
+        buyer_limit_bps: i128,
+        sme_limit_bps: i128,
+        min_deposit: i128,
+        max_deposit: i128,
+        reserve_ratio_bps: i128,
+    ) -> Result<(), ContractError> {
+        if !env.storage().instance().has(&storage::ADMIN) {
+            return Err(ContractError::PoolNotInitialized);
+        }
+        if env.storage().instance().has(&storage::POOL_CFG_SET) {
+            return Err(ContractError::PoolAlreadyCreated);
+        }
+        if buyer_limit_bps <= 0 || buyer_limit_bps > BPS_SCALE {
+            return Err(ContractError::InvalidBps);
+        }
+        if sme_limit_bps <= 0 || sme_limit_bps > BPS_SCALE {
+            return Err(ContractError::InvalidBps);
+        }
+        if reserve_ratio_bps < 0 || reserve_ratio_bps > BPS_SCALE {
+            return Err(ContractError::InvalidBps);
+        }
+        if min_deposit <= 0 || min_deposit > max_deposit {
+            return Err(ContractError::InvalidDepositRange);
+        }
+
+        env.storage().instance().set(&storage::POOL_CFG_SET, &true);
+        env.storage()
+            .instance()
+            .set(&storage::BUYER_LIMIT_BPS, &buyer_limit_bps);
+        env.storage()
+            .instance()
+            .set(&storage::SME_LIMIT_BPS, &sme_limit_bps);
+        env.storage()
+            .instance()
+            .set(&storage::MIN_DEPOSIT, &min_deposit);
+        env.storage()
+            .instance()
+            .set(&storage::MAX_DEPOSIT, &max_deposit);
+        env.storage()
+            .instance()
+            .set(&storage::RESERVE_RATIO_BPS, &reserve_ratio_bps);
+
+        env.events().publish(
+            (symbol_short!("pool_new"),),
+            (buyer_limit_bps, sme_limit_bps, min_deposit, max_deposit, reserve_ratio_bps),
+        );
+        Ok(())
+    }
+
+    pub fn buyer_limit_bps(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&storage::BUYER_LIMIT_BPS)
+            .unwrap_or(0)
+    }
+
+    pub fn sme_limit_bps(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&storage::SME_LIMIT_BPS)
+            .unwrap_or(0)
+    }
+
+    pub fn min_deposit(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&storage::MIN_DEPOSIT)
+            .unwrap_or(0)
+    }
+
+    pub fn max_deposit(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&storage::MAX_DEPOSIT)
+            .unwrap_or(0)
+    }
+
+    pub fn reserve_ratio_bps(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&storage::RESERVE_RATIO_BPS)
+            .unwrap_or(0)
     }
 
     // ── mutators ──────────────────────────────────────────────────────
@@ -747,6 +857,45 @@ mod tests {
             PoolManager::initialize(env.clone(), symbol_short!("admin"), 8_000).unwrap();
         });
         (env, contract_addr)
+    }
+
+    // ── Pool creation config ──────────────────────────────────────────
+
+    #[test]
+    fn create_pool_stores_limits_and_config() {
+        let (env, contract_addr) = setup();
+        env.as_contract(&contract_addr, || {
+            PoolManager::create_pool(env.clone(), 2_000, 1_000, 100, 1_000_000, 500).unwrap();
+        });
+
+        env.as_contract(&contract_addr, || {
+            assert_eq!(PoolManager::buyer_limit_bps(env.clone()), 2_000);
+            assert_eq!(PoolManager::sme_limit_bps(env.clone()), 1_000);
+            assert_eq!(PoolManager::min_deposit(env.clone()), 100);
+            assert_eq!(PoolManager::max_deposit(env.clone()), 1_000_000);
+            assert_eq!(PoolManager::reserve_ratio_bps(env.clone()), 500);
+        });
+    }
+
+    #[test]
+    fn create_pool_rejects_duplicate_configuration() {
+        let (env, contract_addr) = setup();
+        let err = env.as_contract(&contract_addr, || {
+            PoolManager::create_pool(env.clone(), 2_000, 1_000, 100, 1_000_000, 500).unwrap();
+            PoolManager::create_pool(env.clone(), 2_000, 1_000, 100, 1_000_000, 500)
+        });
+        assert_eq!(err, Err(ContractError::PoolAlreadyCreated));
+    }
+
+    #[test]
+    fn create_pool_requires_prior_initialize() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_addr = env.register_contract(None::<&Address>, PoolManager);
+        let err = env.as_contract(&contract_addr, || {
+            PoolManager::create_pool(env.clone(), 2_000, 1_000, 100, 1_000_000, 500)
+        });
+        assert_eq!(err, Err(ContractError::PoolNotInitialized));
     }
 
     // ── Invariant 1: total_shares * NAV / NAV_SCALE == total_capital ─
