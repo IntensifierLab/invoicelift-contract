@@ -42,6 +42,12 @@ mod storage {
     pub const WITHDRAW_UTIL_BPS: Symbol = symbol_short!("wd_util");
     /// Marker field for `DepositTimeKey` — see that type's doc comment for why.
     pub const DEP_TS_TAG: Symbol = symbol_short!("dep_ts");
+
+    /// The currently-queued upgrade, if any.
+    pub const QUEUED_UPGRADE: Symbol = symbol_short!("q_upgrd");
+    /// Emergency-pause flag blocking `execute_upgrade` (queueing/cancelling
+    /// still work while paused).
+    pub const UPGRADE_PAUSED: Symbol = symbol_short!("up_pause");
 }
 
 /// Per-lender last-deposit-timestamp storage key (issue #22).
@@ -112,6 +118,10 @@ pub enum ContractError {
     UtilisationTooHighToWithdraw = 23,
     /// A withdrawal-utilisation threshold was outside `(0, BPS_SCALE]`.
     InvalidWithdrawThreshold = 24,
+    /// `execute_upgrade`/`cancel_upgrade` called with nothing queued.
+    NoQueuedUpgrade = 25,
+    /// `execute_upgrade` was called while emergency-paused.
+    UpgradesPaused = 26,
 }
 
 /// Reserve coverage floor, in basis points (500 = 5%). Rebalancing targets keeping
@@ -143,6 +153,17 @@ pub struct QueuedAction {
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActionKey(pub u32);
+
+/// A queued, timelocked contract-Wasm upgrade. See the `queue_upgrade` doc
+/// comment for the "proxy upgradability pattern" design rationale — Soroban
+/// upgrades in place via Wasm-hash swap rather than a separate proxy
+/// contract, so this is the native equivalent of that pattern.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueuedUpgrade {
+    pub new_wasm_hash: soroban_sdk::BytesN<32>,
+    pub execute_after: u64,
+}
 
 /// Per-lender LP record.
 #[contracttype]
@@ -1018,6 +1039,105 @@ impl PoolManager {
     pub fn version(_env: Env) -> u32 {
         1
     }
+
+    // ── upgrade (proxy upgradability pattern) ───────────────────────────
+    //
+    // Soroban contracts are natively upgradable in place: a contract can
+    // replace its own executable Wasm via `env.deployer()
+    // .update_current_contract_wasm(hash)`, and its persistent/instance
+    // storage is automatically preserved across that call — storage lives
+    // at the contract's address, not in a separate delegatecall-style
+    // proxy. So the idiomatic Soroban equivalent of "proxy holds storage,
+    // logic contract swappable" is a same-contract Wasm-hash swap, not a
+    // separate proxy contract forwarding calls. That's what's implemented
+    // here, gated the same way `queue_parameter_change` already is:
+    // timelock-admin + a mandatory delay.
+    //
+    // "Storage layout migration" under this model isn't an explicit
+    // migration step (there's no separate proxy storage to migrate) — it
+    // means the *new* Wasm's storage reads must stay backward-compatible
+    // with data already written by the version being replaced. That's a
+    // constraint on how you write the next version's code, not something
+    // this function can enforce mechanically.
+
+    /// Queues an upgrade to `new_wasm_hash`, executable no earlier than 48h
+    /// from now (`TIMELOCK_SECS`, same delay as parameter changes). Requires
+    /// the timelock admin's authorization. Returns the ledger timestamp
+    /// after which it becomes executable.
+    pub fn queue_upgrade(env: Env, new_wasm_hash: soroban_sdk::BytesN<32>) -> Result<u64, ContractError> {
+        Self::require_timelock_admin(&env)?;
+
+        let execute_after = env.ledger().timestamp() + TIMELOCK_SECS;
+        env.storage().instance().set(
+            &storage::QUEUED_UPGRADE,
+            &QueuedUpgrade {
+                new_wasm_hash,
+                execute_after,
+            },
+        );
+        Ok(execute_after)
+    }
+
+    /// Executes the queued upgrade once its timelock has elapsed. Callable
+    /// by anyone, same as `execute_parameter_change` — the outcome is fully
+    /// determined by the queued state and current ledger time. Panics via
+    /// `Err` if nothing is queued, the timelock hasn't elapsed, or upgrades
+    /// are currently emergency-paused.
+    pub fn execute_upgrade(env: Env) -> Result<(), ContractError> {
+        let paused: bool = env
+            .storage()
+            .instance()
+            .get(&storage::UPGRADE_PAUSED)
+            .unwrap_or(false);
+        if paused {
+            return Err(ContractError::UpgradesPaused);
+        }
+
+        let queued: QueuedUpgrade = env
+            .storage()
+            .instance()
+            .get(&storage::QUEUED_UPGRADE)
+            .ok_or(ContractError::NoQueuedUpgrade)?;
+        if env.ledger().timestamp() < queued.execute_after {
+            return Err(ContractError::TimelockNotElapsed);
+        }
+
+        env.storage().instance().remove(&storage::QUEUED_UPGRADE);
+        env.deployer()
+            .update_current_contract_wasm(queued.new_wasm_hash);
+        Ok(())
+    }
+
+    /// Cancels the queued upgrade before it executes. Requires the timelock
+    /// admin's authorization.
+    pub fn cancel_upgrade(env: Env) -> Result<(), ContractError> {
+        Self::require_timelock_admin(&env)?;
+        if !env.storage().instance().has(&storage::QUEUED_UPGRADE) {
+            return Err(ContractError::NoQueuedUpgrade);
+        }
+        env.storage().instance().remove(&storage::QUEUED_UPGRADE);
+        Ok(())
+    }
+
+    /// Sets the emergency-pause flag. While paused, `execute_upgrade` is
+    /// blocked (queueing/cancelling a still work — only the final Wasm swap
+    /// is held back). Requires the timelock admin's authorization.
+    pub fn set_upgrade_paused(env: Env, paused: bool) -> Result<(), ContractError> {
+        Self::require_timelock_admin(&env)?;
+        env.storage().instance().set(&storage::UPGRADE_PAUSED, &paused);
+        Ok(())
+    }
+
+    pub fn queued_upgrade(env: Env) -> Option<QueuedUpgrade> {
+        env.storage().instance().get(&storage::QUEUED_UPGRADE)
+    }
+
+    pub fn is_upgrade_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&storage::UPGRADE_PAUSED)
+            .unwrap_or(false)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1795,5 +1915,150 @@ mod tests {
             PoolManager::set_timelock_admin(env.clone(), b)
         });
         assert_eq!(err, Err(ContractError::TimelockAdminAlreadySet));
+    }
+
+    // ── upgrade (proxy upgradability pattern) ───────────────────────────
+    //
+    // These tests exercise the timelock/pause/cancel mechanics thoroughly.
+    // Actually driving `execute_upgrade` to a successful Wasm swap needs a
+    // real uploaded Wasm hash to target, which a native `register_contract`
+    // test fixture (as used throughout this file) doesn't produce - so
+    // "state survives a real upgrade" here relies on Soroban's documented
+    // guarantee that persistent/instance storage lives at the contract's
+    // address independent of which Wasm is currently installed, rather than
+    // being re-proven per PR. What's fully covered below is everything this
+    // function actually gates: the timelock, the emergency pause, and that
+    // there being nothing queued is rejected the same way in both branches.
+
+    fn dummy_wasm_hash(env: &Env) -> soroban_sdk::BytesN<32> {
+        soroban_sdk::BytesN::from_array(env, &[7u8; 32])
+    }
+
+    #[test]
+    fn queue_upgrade_requires_timelock_admin() {
+        let (env, contract_addr) = setup();
+        let hash = dummy_wasm_hash(&env);
+        let err = env.as_contract(&contract_addr, || PoolManager::queue_upgrade(env.clone(), hash));
+        assert_eq!(err, Err(ContractError::TimelockAdminNotSet));
+    }
+
+    #[test]
+    fn queue_upgrade_sets_execute_after_48h_out() {
+        let (env, contract_addr) = setup();
+        let admin_addr = Address::generate(&env);
+        let hash = dummy_wasm_hash(&env);
+
+        let (queued_at, execute_after) = env.as_contract(&contract_addr, || {
+            PoolManager::set_timelock_admin(env.clone(), admin_addr).unwrap();
+            let now = env.ledger().timestamp();
+            let execute_after = PoolManager::queue_upgrade(env.clone(), hash).unwrap();
+            (now, execute_after)
+        });
+        assert_eq!(execute_after, queued_at + 48 * 60 * 60);
+
+        let queued = env.as_contract(&contract_addr, || PoolManager::queued_upgrade(env.clone()));
+        assert_eq!(queued.unwrap().execute_after, execute_after);
+    }
+
+    #[test]
+    fn execute_upgrade_before_timelock_elapses_errors() {
+        let (env, contract_addr) = setup();
+        let admin_addr = Address::generate(&env);
+        let hash = dummy_wasm_hash(&env);
+
+        let err = env.as_contract(&contract_addr, || {
+            PoolManager::set_timelock_admin(env.clone(), admin_addr).unwrap();
+            PoolManager::queue_upgrade(env.clone(), hash).unwrap();
+            PoolManager::execute_upgrade(env.clone())
+        });
+        assert_eq!(err, Err(ContractError::TimelockNotElapsed));
+    }
+
+    #[test]
+    fn execute_upgrade_with_nothing_queued_errors() {
+        let (env, contract_addr) = setup();
+        let err = env.as_contract(&contract_addr, || PoolManager::execute_upgrade(env.clone()));
+        assert_eq!(err, Err(ContractError::NoQueuedUpgrade));
+    }
+
+    #[test]
+    fn cancel_upgrade_clears_the_queue() {
+        let (env, contract_addr) = setup();
+        let admin_addr = Address::generate(&env);
+        let hash = dummy_wasm_hash(&env);
+
+        // Each require_auth-calling entrypoint gets its own as_contract
+        // invocation - calling two in the same frame trips the test host's
+        // "Auth, ExistingValue" guard, same as the existing
+        // queue/cancel_parameter_change tests above already do.
+        env.as_contract(&contract_addr, || {
+            PoolManager::set_timelock_admin(env.clone(), admin_addr).unwrap();
+        });
+        env.as_contract(&contract_addr, || {
+            PoolManager::queue_upgrade(env.clone(), hash).unwrap();
+        });
+        env.as_contract(&contract_addr, || {
+            PoolManager::cancel_upgrade(env.clone()).unwrap();
+        });
+
+        let queued = env.as_contract(&contract_addr, || PoolManager::queued_upgrade(env.clone()));
+        assert!(queued.is_none());
+
+        advance_time(&env, 48 * 60 * 60);
+        let err = env.as_contract(&contract_addr, || PoolManager::execute_upgrade(env.clone()));
+        assert_eq!(err, Err(ContractError::NoQueuedUpgrade));
+    }
+
+    #[test]
+    fn non_admin_cannot_cancel_upgrade() {
+        let (env, contract_addr) = setup();
+        let err = env.as_contract(&contract_addr, || PoolManager::cancel_upgrade(env.clone()));
+        assert_eq!(err, Err(ContractError::TimelockAdminNotSet));
+    }
+
+    #[test]
+    fn execute_upgrade_while_paused_errors_even_after_timelock_elapses() {
+        let (env, contract_addr) = setup();
+        let admin_addr = Address::generate(&env);
+        let hash = dummy_wasm_hash(&env);
+
+        env.as_contract(&contract_addr, || {
+            PoolManager::set_timelock_admin(env.clone(), admin_addr).unwrap();
+        });
+        env.as_contract(&contract_addr, || {
+            PoolManager::queue_upgrade(env.clone(), hash).unwrap();
+        });
+        env.as_contract(&contract_addr, || {
+            PoolManager::set_upgrade_paused(env.clone(), true).unwrap();
+        });
+        env.as_contract(&contract_addr, || {
+            assert!(PoolManager::is_upgrade_paused(env.clone()));
+        });
+
+        advance_time(&env, 48 * 60 * 60);
+
+        let err = env.as_contract(&contract_addr, || PoolManager::execute_upgrade(env.clone()));
+        assert_eq!(err, Err(ContractError::UpgradesPaused));
+    }
+
+    #[test]
+    fn unpausing_allows_execute_upgrade_to_proceed_to_the_timelock_check() {
+        let (env, contract_addr) = setup();
+        let admin_addr = Address::generate(&env);
+
+        // Pause and unpause with nothing queued - once unpaused, the error
+        // surfaced should be the "nothing queued" check past the pause
+        // gate, proving pause no longer blocks execution.
+        env.as_contract(&contract_addr, || {
+            PoolManager::set_timelock_admin(env.clone(), admin_addr).unwrap();
+        });
+        env.as_contract(&contract_addr, || {
+            PoolManager::set_upgrade_paused(env.clone(), true).unwrap();
+        });
+        env.as_contract(&contract_addr, || {
+            PoolManager::set_upgrade_paused(env.clone(), false).unwrap();
+        });
+        let err = env.as_contract(&contract_addr, || PoolManager::execute_upgrade(env.clone()));
+        assert_eq!(err, Err(ContractError::NoQueuedUpgrade));
     }
 }
