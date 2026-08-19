@@ -45,8 +45,10 @@ pub enum ContractError {
     InvalidStatus = 6,
     /// A commitment scale could not be inverted modulo P (not coprime).
     ScaleNotInvertible = 7,
+    /// A transition was attempted on an invoice currently frozen.
+    InvoiceFrozen = 8,
     /// `verify_invoice` called by an address not granted verifier status.
-    NotVerifier = 8,
+    NotVerifier = 9,
 }
 
 /// Per-invoice storage key.
@@ -96,6 +98,14 @@ pub struct CommittedInvoice {
     pub status: InvoiceStatus,
     /// Current owner (SME initially, pool after assignment).
     pub owner: Symbol,
+    /// Set by admin via `flag_invoice` (issue #16) when the invoice is
+    /// suspected fraudulent. Informational — does not itself block
+    /// transitions; see `frozen`.
+    pub fraud_flagged: bool,
+    /// Set by admin via `freeze_invoice` (issue #16). While `true`, all
+    /// state-transition entrypoints (`approve`, `assign`, `mark_repaid`)
+    /// return `ContractError::InvoiceFrozen`.
+    pub frozen: bool,
 }
 
 // ─── Contract ──────────────────────────────────────────────────────────────
@@ -142,6 +152,8 @@ impl InvoiceRegistry {
             commitment,
             status: InvoiceStatus::Pending,
             owner,
+            fraud_flagged: false,
+            frozen: false,
         };
 
         env.storage().persistent().set(&key, &invoice);
@@ -159,6 +171,9 @@ impl InvoiceRegistry {
             .get(&key)
             .ok_or(ContractError::InvoiceNotFound)?;
 
+        if invoice.frozen {
+            return Err(ContractError::InvoiceFrozen);
+        }
         if invoice.status != InvoiceStatus::Pending {
             return Err(ContractError::InvalidStatus);
         }
@@ -241,6 +256,9 @@ impl InvoiceRegistry {
             .get(&key)
             .ok_or(ContractError::InvoiceNotFound)?;
 
+        if invoice.frozen {
+            return Err(ContractError::InvoiceFrozen);
+        }
         if invoice.status != InvoiceStatus::Approved {
             return Err(ContractError::InvalidStatus);
         }
@@ -299,12 +317,83 @@ impl InvoiceRegistry {
             .get(&key)
             .ok_or(ContractError::InvoiceNotFound)?;
 
+        if invoice.frozen {
+            return Err(ContractError::InvoiceFrozen);
+        }
         if invoice.status != InvoiceStatus::Assigned {
             return Err(ContractError::InvalidStatus);
         }
 
         invoice.status = InvoiceStatus::Repaid;
         env.storage().persistent().set(&key, &invoice);
+        Ok(())
+    }
+
+    // ── Fraud flag & freeze (issue #16) ─────────────────────────────────
+
+    /// Admin marks an invoice as suspicious. Informational only — does not
+    /// block transitions on its own; pair with [`Self::freeze_invoice`] to
+    /// actually halt the invoice.
+    pub fn flag_invoice(env: Env, caller: Symbol, id: Symbol) -> Result<(), ContractError> {
+        Self::require_admin(&env, &caller)?;
+
+        let key = InvoiceKey(id);
+        let mut invoice: CommittedInvoice = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::InvoiceNotFound)?;
+
+        invoice.fraud_flagged = true;
+        env.storage().persistent().set(&key, &invoice);
+
+        env.events()
+            .publish((symbol_short!("inv_flag"),), invoice.id);
+        Ok(())
+    }
+
+    /// Admin freezes an invoice, blocking all further state transitions
+    /// (`approve`, `assign`, `mark_repaid`) until lifted.
+    pub fn freeze_invoice(env: Env, caller: Symbol, id: Symbol) -> Result<(), ContractError> {
+        Self::require_admin(&env, &caller)?;
+
+        let key = InvoiceKey(id);
+        let mut invoice: CommittedInvoice = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::InvoiceNotFound)?;
+
+        invoice.frozen = true;
+        env.storage().persistent().set(&key, &invoice);
+
+        env.events()
+            .publish((symbol_short!("inv_frz"),), invoice.id);
+        Ok(())
+    }
+
+    /// Admin lifts a freeze, with `justification` recorded in the emitted
+    /// event for the audit trail.
+    pub fn unfreeze_invoice(
+        env: Env,
+        caller: Symbol,
+        id: Symbol,
+        justification: Symbol,
+    ) -> Result<(), ContractError> {
+        Self::require_admin(&env, &caller)?;
+
+        let key = InvoiceKey(id);
+        let mut invoice: CommittedInvoice = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::InvoiceNotFound)?;
+
+        invoice.frozen = false;
+        env.storage().persistent().set(&key, &invoice);
+
+        env.events()
+            .publish((symbol_short!("inv_unfrz"), justification), invoice.id);
         Ok(())
     }
 
@@ -791,6 +880,86 @@ mod tests {
             InvoiceRegistry::get_invoice(env.clone(), inv_id).expect("missing")
         });
         assert_eq!(invoice.status, InvoiceStatus::Repaid);
+    }
+
+    // ── Fraud flag & freeze ─────────────────────────────────────────────
+
+    #[test]
+    fn test_flag_invoice_sets_fraud_flag() {
+        let (env, contract_addr) = setup();
+        let inv_id = symbol_short!("INV015");
+        let commitment = test_commitment(10_000, 1);
+
+        env.as_contract(&contract_addr, || {
+            InvoiceRegistry::register(
+                env.clone(),
+                inv_id.clone(),
+                commitment,
+                symbol_short!("sme1"),
+            )
+            .unwrap();
+            InvoiceRegistry::flag_invoice(env.clone(), symbol_short!("admin"), inv_id.clone())
+                .unwrap();
+        });
+
+        let invoice = env.as_contract(&contract_addr, || {
+            InvoiceRegistry::get_invoice(env.clone(), inv_id).expect("missing")
+        });
+        assert!(invoice.fraud_flagged);
+    }
+
+    #[test]
+    fn test_freeze_invoice_blocks_approve() {
+        let (env, contract_addr) = setup();
+        let inv_id = symbol_short!("INV016");
+        let commitment = test_commitment(10_000, 2);
+
+        let err = env.as_contract(&contract_addr, || {
+            InvoiceRegistry::register(
+                env.clone(),
+                inv_id.clone(),
+                commitment,
+                symbol_short!("sme1"),
+            )
+            .unwrap();
+            InvoiceRegistry::freeze_invoice(env.clone(), symbol_short!("admin"), inv_id.clone())
+                .unwrap();
+            InvoiceRegistry::approve(env.clone(), symbol_short!("admin"), inv_id)
+        });
+        assert_eq!(err, Err(ContractError::InvoiceFrozen));
+    }
+
+    #[test]
+    fn test_unfreeze_invoice_lifts_block() {
+        let (env, contract_addr) = setup();
+        let inv_id = symbol_short!("INV017");
+        let commitment = test_commitment(10_000, 3);
+
+        env.as_contract(&contract_addr, || {
+            InvoiceRegistry::register(
+                env.clone(),
+                inv_id.clone(),
+                commitment,
+                symbol_short!("sme1"),
+            )
+            .unwrap();
+            InvoiceRegistry::freeze_invoice(env.clone(), symbol_short!("admin"), inv_id.clone())
+                .unwrap();
+            InvoiceRegistry::unfreeze_invoice(
+                env.clone(),
+                symbol_short!("admin"),
+                inv_id.clone(),
+                symbol_short!("cleared"),
+            )
+            .unwrap();
+            InvoiceRegistry::approve(env.clone(), symbol_short!("admin"), inv_id.clone()).unwrap();
+        });
+
+        let invoice = env.as_contract(&contract_addr, || {
+            InvoiceRegistry::get_invoice(env.clone(), inv_id).expect("missing")
+        });
+        assert_eq!(invoice.status, InvoiceStatus::Approved);
+        assert!(!invoice.frozen);
     }
 
     // ── Verify Amount ────────────────────────────────────────────────────
