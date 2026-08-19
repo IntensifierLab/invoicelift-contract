@@ -8,7 +8,9 @@
 
 mod pedersen;
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, symbol_short, Env, Symbol};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Symbol,
+};
 
 // ─── Storage Keys ──────────────────────────────────────────────────────────
 
@@ -173,6 +175,43 @@ impl InvoiceRegistry {
         Ok(())
     }
 
+    // ── Pool financing assignment (issue #15) ───────────────────────────
+
+    /// Transfers financing rights on an approved invoice to a pool, callable
+    /// only by the pool-manager contract identified by `pool_manager`
+    /// (authenticated via `require_auth`, not the registry admin).
+    ///
+    /// Transitions Approved → Assigned and stores `pool` (the financing pool
+    /// identifier) as the invoice's owner. Emits an `InvoiceAssigned` event
+    /// carrying the pool address.
+    pub fn assign_invoice(
+        env: Env,
+        pool_manager: Address,
+        id: Symbol,
+        pool: Symbol,
+    ) -> Result<(), ContractError> {
+        pool_manager.require_auth();
+
+        let key = InvoiceKey(id);
+        let mut invoice: CommittedInvoice = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::InvoiceNotFound)?;
+
+        if invoice.status != InvoiceStatus::Approved {
+            return Err(ContractError::InvalidStatus);
+        }
+
+        invoice.status = InvoiceStatus::Assigned;
+        invoice.owner = pool.clone();
+        env.storage().persistent().set(&key, &invoice);
+
+        env.events()
+            .publish((symbol_short!("inv_asgn"), pool), invoice.id);
+        Ok(())
+    }
+
     /// Admin marks an assigned invoice as repaid (Assigned → Repaid).
     pub fn mark_repaid(env: Env, caller: Symbol, id: Symbol) -> Result<(), ContractError> {
         Self::require_admin(&env, &caller)?;
@@ -305,6 +344,7 @@ impl InvoiceRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use soroban_sdk::testutils::Address as _;
     use soroban_sdk::{Address, Env};
 
     fn setup() -> (Env, soroban_sdk::Address) {
@@ -447,6 +487,64 @@ mod tests {
         });
         assert_eq!(invoice.status, InvoiceStatus::Assigned);
         assert_eq!(invoice.owner, symbol_short!("pool1"));
+    }
+
+    #[test]
+    fn test_assign_invoice_by_pool_manager_stores_pool_address() {
+        let (env, contract_addr) = setup();
+        let inv_id = symbol_short!("INV013");
+        let commitment = test_commitment(45_000, 444);
+        let pool_manager = Address::generate(&env);
+
+        env.as_contract(&contract_addr, || {
+            InvoiceRegistry::register(
+                env.clone(),
+                inv_id.clone(),
+                commitment,
+                symbol_short!("sme1"),
+            )
+            .unwrap();
+            InvoiceRegistry::approve(env.clone(), symbol_short!("admin"), inv_id.clone()).unwrap();
+            InvoiceRegistry::assign_invoice(
+                env.clone(),
+                pool_manager,
+                inv_id.clone(),
+                symbol_short!("pool9"),
+            )
+            .unwrap();
+        });
+
+        let invoice = env.as_contract(&contract_addr, || {
+            InvoiceRegistry::get_invoice(env.clone(), inv_id).expect("missing")
+        });
+        assert_eq!(invoice.status, InvoiceStatus::Assigned);
+        assert_eq!(invoice.owner, symbol_short!("pool9"));
+    }
+
+    #[test]
+    fn test_assign_invoice_wrong_state_errors() {
+        let (env, contract_addr) = setup();
+        let inv_id = symbol_short!("INV014");
+        let commitment = test_commitment(45_000, 555);
+        let pool_manager = Address::generate(&env);
+
+        let err = env.as_contract(&contract_addr, || {
+            InvoiceRegistry::register(
+                env.clone(),
+                inv_id.clone(),
+                commitment,
+                symbol_short!("sme1"),
+            )
+            .unwrap();
+            // Still Pending — not Approved — so this must error.
+            InvoiceRegistry::assign_invoice(
+                env.clone(),
+                pool_manager,
+                inv_id,
+                symbol_short!("pool9"),
+            )
+        });
+        assert_eq!(err, Err(ContractError::InvalidStatus));
     }
 
     // ── Mark Repaid ──────────────────────────────────────────────────────
