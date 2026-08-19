@@ -6,9 +6,14 @@
 //! are ever written on-chain. Only parties holding the opening `(value, blinding)`
 //! can verify (or prove to an auditor) the original amount.
 
+mod nft;
 mod pedersen;
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, symbol_short, Env, Symbol};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Symbol,
+};
+
+pub use nft::TransferRecord;
 
 // ─── Storage Keys ──────────────────────────────────────────────────────────
 
@@ -16,6 +21,8 @@ mod storage {
     use soroban_sdk::{symbol_short, Symbol};
 
     pub const ADMIN: Symbol = symbol_short!("admin");
+    /// Marker field for `VerifierKey` — see that type's doc comment for why.
+    pub const VERIFIER_TAG: Symbol = symbol_short!("verifier");
 }
 
 /// Errors surfaced by the invoice registry. Stable `u32` discriminants so
@@ -38,12 +45,26 @@ pub enum ContractError {
     InvalidStatus = 6,
     /// A commitment scale could not be inverted modulo P (not coprime).
     ScaleNotInvertible = 7,
+    /// `verify_invoice` called by an address not granted verifier status.
+    NotVerifier = 8,
 }
 
 /// Per-invoice storage key.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InvoiceKey(pub Symbol);
+
+/// Per-verifier storage key (issue #14): `VerifierKey(marker, verifier) -> bool`.
+///
+/// Carries a fixed marker as its first field: `#[contracttype]` encodes a
+/// tuple struct as a bare XDR vec of its fields with no type-name
+/// discriminant, so a single-`Symbol`-field key here would be
+/// indistinguishable on-ledger from `InvoiceKey` (or any other
+/// single-`Symbol` key) sharing the same value — the marker keeps this
+/// key's storage slot from colliding with theirs.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifierKey(pub Symbol, pub Symbol);
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
@@ -147,6 +168,63 @@ impl InvoiceRegistry {
         Ok(())
     }
 
+    // ── Verification (issue #14) ────────────────────────────────────────
+
+    /// Admin grants (or revokes) verifier status for `verifier`. Only
+    /// addresses granted verifier status may call [`Self::verify_invoice`].
+    pub fn set_verifier(
+        env: Env,
+        caller: Symbol,
+        verifier: Symbol,
+        is_verifier: bool,
+    ) -> Result<(), ContractError> {
+        Self::require_admin(&env, &caller)?;
+        env.storage()
+            .persistent()
+            .set(&VerifierKey(storage::VERIFIER_TAG, verifier), &is_verifier);
+        Ok(())
+    }
+
+    /// Whether `verifier` currently holds verifier status.
+    pub fn is_verifier(env: Env, verifier: Symbol) -> bool {
+        env.storage()
+            .persistent()
+            .get(&VerifierKey(storage::VERIFIER_TAG, verifier))
+            .unwrap_or(false)
+    }
+
+    /// A verifier (granted via [`Self::set_verifier`]) verifies a pending
+    /// invoice (Pending → Approved). This is a separate entrypoint from
+    /// [`Self::approve`] so verification duties can be delegated to a set of
+    /// verifiers distinct from the contract admin.
+    ///
+    /// Returns [`ContractError::NotVerifier`] if the caller was never
+    /// granted verifier status, or [`ContractError::InvalidStatus`] if the
+    /// invoice is not currently `Pending`.
+    pub fn verify_invoice(env: Env, caller: Symbol, id: Symbol) -> Result<(), ContractError> {
+        if !Self::is_verifier(env.clone(), caller) {
+            return Err(ContractError::NotVerifier);
+        }
+
+        let key = InvoiceKey(id);
+        let mut invoice: CommittedInvoice = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::InvoiceNotFound)?;
+
+        if invoice.status != InvoiceStatus::Pending {
+            return Err(ContractError::InvalidStatus);
+        }
+
+        invoice.status = InvoiceStatus::Approved;
+        env.storage().persistent().set(&key, &invoice);
+
+        env.events()
+            .publish((symbol_short!("inv_ver"),), invoice.id);
+        Ok(())
+    }
+
     /// Admin assigns an approved invoice to a new owner / pool (Approved → Assigned).
     pub fn assign(
         env: Env,
@@ -170,6 +248,43 @@ impl InvoiceRegistry {
         invoice.status = InvoiceStatus::Assigned;
         invoice.owner = new_owner;
         env.storage().persistent().set(&key, &invoice);
+        Ok(())
+    }
+
+    // ── Pool financing assignment (issue #15) ───────────────────────────
+
+    /// Transfers financing rights on an approved invoice to a pool, callable
+    /// only by the pool-manager contract identified by `pool_manager`
+    /// (authenticated via `require_auth`, not the registry admin).
+    ///
+    /// Transitions Approved → Assigned and stores `pool` (the financing pool
+    /// identifier) as the invoice's owner. Emits an `InvoiceAssigned` event
+    /// carrying the pool address.
+    pub fn assign_invoice(
+        env: Env,
+        pool_manager: Address,
+        id: Symbol,
+        pool: Symbol,
+    ) -> Result<(), ContractError> {
+        pool_manager.require_auth();
+
+        let key = InvoiceKey(id);
+        let mut invoice: CommittedInvoice = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::InvoiceNotFound)?;
+
+        if invoice.status != InvoiceStatus::Approved {
+            return Err(ContractError::InvalidStatus);
+        }
+
+        invoice.status = InvoiceStatus::Assigned;
+        invoice.owner = pool.clone();
+        env.storage().persistent().set(&key, &invoice);
+
+        env.events()
+            .publish((symbol_short!("inv_asgn"), pool), invoice.id);
         Ok(())
     }
 
@@ -246,6 +361,61 @@ impl InvoiceRegistry {
     }
 }
 
+// ── Invoice NFT tokenisation ────────────────────────────────────────────
+//
+// A separate `impl` block (rather than more methods on the block above) so
+// this addition doesn't need to touch the existing entrypoints' region at
+// all - see `nft` for the full design (token model, royalty-hook,
+// single-owner repayment-share simplification).
+#[contractimpl]
+impl InvoiceRegistry {
+    /// Mint the token for `token_id` (typically an invoice id, called once
+    /// it's financed) with `owner` as its initial owner. Admin-gated.
+    pub fn mint_invoice_token(
+        env: Env,
+        caller: Symbol,
+        token_id: Symbol,
+        owner: Symbol,
+    ) -> Result<(), ContractError> {
+        Self::require_admin(&env, &caller)?;
+        nft::mint(&env, token_id, owner);
+        Ok(())
+    }
+
+    /// Transfer `token_id` from `from` to `to`, recording the transfer
+    /// on-chain and publishing a royalty-hook event. `from` must be the
+    /// token's current owner.
+    pub fn transfer_invoice_token(
+        env: Env,
+        token_id: Symbol,
+        from: Symbol,
+        to: Symbol,
+        royalty_bps: u32,
+    ) {
+        nft::transfer(&env, token_id, from, to, royalty_bps);
+    }
+
+    /// Current owner of `token_id`, or `None` if it hasn't been minted.
+    pub fn invoice_owner(env: Env, token_id: Symbol) -> Option<Symbol> {
+        nft::owner_of(&env, token_id)
+    }
+
+    /// Full on-chain transfer history for `token_id`.
+    pub fn invoice_transfer_history(env: Env, token_id: Symbol) -> soroban_sdk::Vec<TransferRecord> {
+        nft::transfer_history(&env, token_id)
+    }
+
+    /// The current owner's share of `total_repayment` (single-owner model —
+    /// see `nft` module docs).
+    pub fn invoice_repayment_share(
+        env: Env,
+        token_id: Symbol,
+        total_repayment: i128,
+    ) -> (Symbol, i128) {
+        nft::repayment_share(&env, token_id, total_repayment)
+    }
+}
+
 // Contribution check by nancy-k at 2024-11-21T23:51:43
 
 // Contribution check by oluwagbemiga at 2025-02-26T05:22:45
@@ -305,6 +475,7 @@ impl InvoiceRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use soroban_sdk::testutils::Address as _;
     use soroban_sdk::{Address, Env};
 
     fn setup() -> (Env, soroban_sdk::Address) {
@@ -416,6 +587,87 @@ mod tests {
         assert_eq!(err, Err(ContractError::Unauthorized));
     }
 
+    // ── Verification ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_verify_invoice_by_granted_verifier_transitions_status() {
+        let (env, contract_addr) = setup();
+        let inv_id = symbol_short!("INV010");
+        let commitment = test_commitment(15_000, 111);
+
+        env.as_contract(&contract_addr, || {
+            InvoiceRegistry::register(
+                env.clone(),
+                inv_id.clone(),
+                commitment,
+                symbol_short!("sme1"),
+            )
+            .unwrap();
+            InvoiceRegistry::set_verifier(
+                env.clone(),
+                symbol_short!("admin"),
+                symbol_short!("ver1"),
+                true,
+            )
+            .unwrap();
+            InvoiceRegistry::verify_invoice(env.clone(), symbol_short!("ver1"), inv_id.clone())
+                .unwrap();
+        });
+
+        let invoice = env.as_contract(&contract_addr, || {
+            InvoiceRegistry::get_invoice(env.clone(), inv_id).expect("missing")
+        });
+        assert_eq!(invoice.status, InvoiceStatus::Approved);
+    }
+
+    #[test]
+    fn test_verify_invoice_non_verifier_errors() {
+        let (env, contract_addr) = setup();
+        let inv_id = symbol_short!("INV011");
+        let commitment = test_commitment(15_000, 222);
+
+        let err = env.as_contract(&contract_addr, || {
+            InvoiceRegistry::register(
+                env.clone(),
+                inv_id.clone(),
+                commitment,
+                symbol_short!("sme1"),
+            )
+            .unwrap();
+            InvoiceRegistry::verify_invoice(env.clone(), symbol_short!("rando"), inv_id)
+        });
+        assert_eq!(err, Err(ContractError::NotVerifier));
+    }
+
+    #[test]
+    fn test_verify_invoice_wrong_state_errors() {
+        let (env, contract_addr) = setup();
+        let inv_id = symbol_short!("INV012");
+        let commitment = test_commitment(15_000, 333);
+
+        let err = env.as_contract(&contract_addr, || {
+            InvoiceRegistry::register(
+                env.clone(),
+                inv_id.clone(),
+                commitment,
+                symbol_short!("sme1"),
+            )
+            .unwrap();
+            InvoiceRegistry::set_verifier(
+                env.clone(),
+                symbol_short!("admin"),
+                symbol_short!("ver1"),
+                true,
+            )
+            .unwrap();
+            InvoiceRegistry::approve(env.clone(), symbol_short!("admin"), inv_id.clone())
+                .unwrap();
+            // Already Approved — not Pending — so this must error.
+            InvoiceRegistry::verify_invoice(env.clone(), symbol_short!("ver1"), inv_id)
+        });
+        assert_eq!(err, Err(ContractError::InvalidStatus));
+    }
+
     // ── Assignment ───────────────────────────────────────────────────────
 
     #[test]
@@ -447,6 +699,64 @@ mod tests {
         });
         assert_eq!(invoice.status, InvoiceStatus::Assigned);
         assert_eq!(invoice.owner, symbol_short!("pool1"));
+    }
+
+    #[test]
+    fn test_assign_invoice_by_pool_manager_stores_pool_address() {
+        let (env, contract_addr) = setup();
+        let inv_id = symbol_short!("INV013");
+        let commitment = test_commitment(45_000, 444);
+        let pool_manager = Address::generate(&env);
+
+        env.as_contract(&contract_addr, || {
+            InvoiceRegistry::register(
+                env.clone(),
+                inv_id.clone(),
+                commitment,
+                symbol_short!("sme1"),
+            )
+            .unwrap();
+            InvoiceRegistry::approve(env.clone(), symbol_short!("admin"), inv_id.clone()).unwrap();
+            InvoiceRegistry::assign_invoice(
+                env.clone(),
+                pool_manager,
+                inv_id.clone(),
+                symbol_short!("pool9"),
+            )
+            .unwrap();
+        });
+
+        let invoice = env.as_contract(&contract_addr, || {
+            InvoiceRegistry::get_invoice(env.clone(), inv_id).expect("missing")
+        });
+        assert_eq!(invoice.status, InvoiceStatus::Assigned);
+        assert_eq!(invoice.owner, symbol_short!("pool9"));
+    }
+
+    #[test]
+    fn test_assign_invoice_wrong_state_errors() {
+        let (env, contract_addr) = setup();
+        let inv_id = symbol_short!("INV014");
+        let commitment = test_commitment(45_000, 555);
+        let pool_manager = Address::generate(&env);
+
+        let err = env.as_contract(&contract_addr, || {
+            InvoiceRegistry::register(
+                env.clone(),
+                inv_id.clone(),
+                commitment,
+                symbol_short!("sme1"),
+            )
+            .unwrap();
+            // Still Pending — not Approved — so this must error.
+            InvoiceRegistry::assign_invoice(
+                env.clone(),
+                pool_manager,
+                inv_id,
+                symbol_short!("pool9"),
+            )
+        });
+        assert_eq!(err, Err(ContractError::InvalidStatus));
     }
 
     // ── Mark Repaid ──────────────────────────────────────────────────────
