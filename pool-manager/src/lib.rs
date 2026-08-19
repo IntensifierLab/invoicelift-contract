@@ -31,7 +31,30 @@ mod storage {
     pub const MIN_DEPOSIT: Symbol = symbol_short!("min_dep");
     pub const MAX_DEPOSIT: Symbol = symbol_short!("max_dep");
     pub const RESERVE_RATIO_BPS: Symbol = symbol_short!("rsv_rat");
+
+    // ── Withdrawal lock period (issue #22) ──────────────────────────────
+    /// Seconds a deposit must sit before it can be withdrawn. Defaults to 0
+    /// (no lock) if never configured via `set_lock_period`.
+    pub const LOCK_SECS: Symbol = symbol_short!("lock_sec");
+    /// Withdrawals are blocked once pool utilisation (financed / capital)
+    /// exceeds this bps threshold. Defaults to `BPS_SCALE` (100%, i.e. no
+    /// extra restriction) if never configured.
+    pub const WITHDRAW_UTIL_BPS: Symbol = symbol_short!("wd_util");
+    /// Marker field for `DepositTimeKey` — see that type's doc comment for why.
+    pub const DEP_TS_TAG: Symbol = symbol_short!("dep_ts");
 }
+
+/// Per-lender last-deposit-timestamp storage key (issue #22).
+///
+/// Carries a fixed marker as its first field: `#[contracttype]` encodes a
+/// tuple struct as a bare XDR vec of its fields with no type-name
+/// discriminant, so a single-`Symbol`-field key here would be
+/// indistinguishable on-ledger from `LenderKey` (or any other
+/// single-`Symbol` key) sharing the same value — the marker keeps this
+/// key's storage slot from colliding with theirs.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DepositTimeKey(pub Symbol, pub Symbol);
 
 /// Errors surfaced by the pool manager. Stable `u32` discriminants so
 /// integrators and audit tooling can match on them.
@@ -81,6 +104,14 @@ pub enum ContractError {
     InvalidBps = 20,
     /// `min_deposit` was not strictly positive, or exceeded `max_deposit`.
     InvalidDepositRange = 21,
+    /// A withdrawal was attempted while the lender's most recent deposit is
+    /// still within the configured lock period.
+    WithdrawalLocked = 22,
+    /// A withdrawal was attempted while pool utilisation is above the
+    /// configured withdrawal threshold.
+    UtilisationTooHighToWithdraw = 23,
+    /// A withdrawal-utilisation threshold was outside `(0, BPS_SCALE]`.
+    InvalidWithdrawThreshold = 24,
 }
 
 /// Reserve coverage floor, in basis points (500 = 5%). Rebalancing targets keeping
@@ -295,6 +326,13 @@ impl PoolManager {
             .instance()
             .set(&storage::TOTAL_CAPITAL, &(new_tot_shares * nav / NAV_SCALE));
 
+        // Record this deposit's timestamp so `withdraw` can enforce the
+        // post-deposit lock period (issue #22).
+        env.storage().persistent().set(
+            &DepositTimeKey(storage::DEP_TS_TAG, key.0),
+            &env.ledger().timestamp(),
+        );
+
         Ok(shares)
     }
 
@@ -356,6 +394,13 @@ impl PoolManager {
             .instance()
             .set(&storage::TOTAL_CAPITAL, &(new_tot_shares * nav / NAV_SCALE));
 
+        // Record this deposit's timestamp so `withdraw` can enforce the
+        // post-deposit lock period (issue #22).
+        env.storage().persistent().set(
+            &DepositTimeKey(storage::DEP_TS_TAG, key.0),
+            &env.ledger().timestamp(),
+        );
+
         env.events()
             .publish((symbol_short!("shr_mint"), lender), shares);
 
@@ -363,9 +408,49 @@ impl PoolManager {
     }
 
     /// Withdraw capital. Returns the amount withdrawn in base units.
+    ///
+    /// Blocked (issue #22) if `lender`'s most recent deposit is still within
+    /// the configured lock period (see `set_lock_period`), or if pool
+    /// utilisation (financed / capital) is above the configured withdrawal
+    /// threshold (see `set_withdraw_util_threshold`).
     pub fn withdraw(env: Env, lender: Symbol, shares: i128) -> Result<i128, ContractError> {
         if shares <= 0 {
             return Err(ContractError::InvalidShares);
+        }
+
+        let lock_secs: u64 = env.storage().instance().get(&storage::LOCK_SECS).unwrap_or(0);
+        if lock_secs > 0 {
+            if let Some(deposited_at) = env
+                .storage()
+                .persistent()
+                .get::<_, u64>(&DepositTimeKey(storage::DEP_TS_TAG, lender.clone()))
+            {
+                if env.ledger().timestamp() < deposited_at + lock_secs {
+                    return Err(ContractError::WithdrawalLocked);
+                }
+            }
+        }
+
+        let withdraw_util_bps: i128 = env
+            .storage()
+            .instance()
+            .get(&storage::WITHDRAW_UTIL_BPS)
+            .unwrap_or(BPS_SCALE);
+        let cap_before: i128 = env
+            .storage()
+            .instance()
+            .get(&storage::TOTAL_CAPITAL)
+            .unwrap_or(0);
+        let fin_before: i128 = env
+            .storage()
+            .instance()
+            .get(&storage::FINANCED_AMT)
+            .unwrap_or(0);
+        if cap_before > 0 {
+            let current_util_bps = fin_before * BPS_SCALE / cap_before;
+            if current_util_bps > withdraw_util_bps {
+                return Err(ContractError::UtilisationTooHighToWithdraw);
+            }
         }
 
         let key = LenderKey(lender);
@@ -423,7 +508,40 @@ impl PoolManager {
             env.storage().instance().set(&storage::FINANCED_AMT, &limit);
         }
 
+        env.events()
+            .publish((symbol_short!("shr_burn"), key.0), shares);
+
         Ok(amount)
+    }
+
+    // ── Withdrawal lock configuration (issue #22) ───────────────────────
+
+    /// Configures the post-deposit lock period, in seconds.
+    pub fn set_lock_period(env: Env, secs: u64) {
+        env.storage().instance().set(&storage::LOCK_SECS, &secs);
+    }
+
+    pub fn lock_period(env: Env) -> u64 {
+        env.storage().instance().get(&storage::LOCK_SECS).unwrap_or(0)
+    }
+
+    /// Configures the pool-utilisation bps threshold above which withdrawals
+    /// are blocked.
+    pub fn set_withdraw_util_threshold(env: Env, bps: i128) -> Result<(), ContractError> {
+        if bps <= 0 || bps > BPS_SCALE {
+            return Err(ContractError::InvalidWithdrawThreshold);
+        }
+        env.storage()
+            .instance()
+            .set(&storage::WITHDRAW_UTIL_BPS, &bps);
+        Ok(())
+    }
+
+    pub fn withdraw_util_threshold(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&storage::WITHDRAW_UTIL_BPS)
+            .unwrap_or(BPS_SCALE)
     }
 
     /// Mark an invoice as financed. `amount` is the financed value.
@@ -921,6 +1039,53 @@ mod tests {
             PoolManager::initialize(env.clone(), symbol_short!("admin"), 8_000).unwrap();
         });
         (env, contract_addr)
+    }
+
+    // ── Withdrawal lock period ────────────────────────────────────────
+
+    #[test]
+    fn withdraw_blocked_during_lock_period() {
+        let (env, contract_addr) = setup();
+        let alice = symbol_short!("alice");
+
+        let err = env.as_contract(&contract_addr, || {
+            PoolManager::set_lock_period(env.clone(), 60 * 60 * 24 * 7); // 7 days
+            PoolManager::deposit(env.clone(), alice.clone(), 10_000).unwrap();
+            PoolManager::withdraw(env.clone(), alice, 1_000)
+        });
+        assert_eq!(err, Err(ContractError::WithdrawalLocked));
+    }
+
+    #[test]
+    fn withdraw_allowed_after_lock_period_elapses() {
+        let (env, contract_addr) = setup();
+        let alice = symbol_short!("alice");
+
+        env.as_contract(&contract_addr, || {
+            PoolManager::set_lock_period(env.clone(), 60 * 60 * 24 * 7);
+            PoolManager::deposit(env.clone(), alice.clone(), 10_000).unwrap();
+        });
+
+        advance_time(&env, 60 * 60 * 24 * 7);
+
+        env.as_contract(&contract_addr, || {
+            let out = PoolManager::withdraw(env.clone(), alice, 1_000).unwrap();
+            assert_eq!(out, 1_000);
+        });
+    }
+
+    #[test]
+    fn withdraw_blocked_above_utilisation_threshold() {
+        let (env, contract_addr) = setup();
+        let alice = symbol_short!("alice");
+
+        let err = env.as_contract(&contract_addr, || {
+            PoolManager::set_withdraw_util_threshold(env.clone(), 5_000).unwrap(); // 50%
+            PoolManager::deposit(env.clone(), alice.clone(), 100_000).unwrap();
+            PoolManager::finance(env.clone(), 70_000).unwrap(); // 70% utilisation > 50% threshold
+            PoolManager::withdraw(env.clone(), alice, 1_000)
+        });
+        assert_eq!(err, Err(ContractError::UtilisationTooHighToWithdraw));
     }
 
     // ── Pool creation config ──────────────────────────────────────────
