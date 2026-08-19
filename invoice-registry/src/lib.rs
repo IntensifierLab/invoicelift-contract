@@ -16,6 +16,8 @@ mod storage {
     use soroban_sdk::{symbol_short, Symbol};
 
     pub const ADMIN: Symbol = symbol_short!("admin");
+    /// Marker field for `VerifierKey` — see that type's doc comment for why.
+    pub const VERIFIER_TAG: Symbol = symbol_short!("verifier");
 }
 
 /// Errors surfaced by the invoice registry. Stable `u32` discriminants so
@@ -38,12 +40,26 @@ pub enum ContractError {
     InvalidStatus = 6,
     /// A commitment scale could not be inverted modulo P (not coprime).
     ScaleNotInvertible = 7,
+    /// `verify_invoice` called by an address not granted verifier status.
+    NotVerifier = 8,
 }
 
 /// Per-invoice storage key.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InvoiceKey(pub Symbol);
+
+/// Per-verifier storage key (issue #14): `VerifierKey(marker, verifier) -> bool`.
+///
+/// Carries a fixed marker as its first field: `#[contracttype]` encodes a
+/// tuple struct as a bare XDR vec of its fields with no type-name
+/// discriminant, so a single-`Symbol`-field key here would be
+/// indistinguishable on-ledger from `InvoiceKey` (or any other
+/// single-`Symbol` key) sharing the same value — the marker keeps this
+/// key's storage slot from colliding with theirs.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifierKey(pub Symbol, pub Symbol);
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
@@ -144,6 +160,63 @@ impl InvoiceRegistry {
 
         invoice.status = InvoiceStatus::Approved;
         env.storage().persistent().set(&key, &invoice);
+        Ok(())
+    }
+
+    // ── Verification (issue #14) ────────────────────────────────────────
+
+    /// Admin grants (or revokes) verifier status for `verifier`. Only
+    /// addresses granted verifier status may call [`Self::verify_invoice`].
+    pub fn set_verifier(
+        env: Env,
+        caller: Symbol,
+        verifier: Symbol,
+        is_verifier: bool,
+    ) -> Result<(), ContractError> {
+        Self::require_admin(&env, &caller)?;
+        env.storage()
+            .persistent()
+            .set(&VerifierKey(storage::VERIFIER_TAG, verifier), &is_verifier);
+        Ok(())
+    }
+
+    /// Whether `verifier` currently holds verifier status.
+    pub fn is_verifier(env: Env, verifier: Symbol) -> bool {
+        env.storage()
+            .persistent()
+            .get(&VerifierKey(storage::VERIFIER_TAG, verifier))
+            .unwrap_or(false)
+    }
+
+    /// A verifier (granted via [`Self::set_verifier`]) verifies a pending
+    /// invoice (Pending → Approved). This is a separate entrypoint from
+    /// [`Self::approve`] so verification duties can be delegated to a set of
+    /// verifiers distinct from the contract admin.
+    ///
+    /// Returns [`ContractError::NotVerifier`] if the caller was never
+    /// granted verifier status, or [`ContractError::InvalidStatus`] if the
+    /// invoice is not currently `Pending`.
+    pub fn verify_invoice(env: Env, caller: Symbol, id: Symbol) -> Result<(), ContractError> {
+        if !Self::is_verifier(env.clone(), caller) {
+            return Err(ContractError::NotVerifier);
+        }
+
+        let key = InvoiceKey(id);
+        let mut invoice: CommittedInvoice = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::InvoiceNotFound)?;
+
+        if invoice.status != InvoiceStatus::Pending {
+            return Err(ContractError::InvalidStatus);
+        }
+
+        invoice.status = InvoiceStatus::Approved;
+        env.storage().persistent().set(&key, &invoice);
+
+        env.events()
+            .publish((symbol_short!("inv_ver"),), invoice.id);
         Ok(())
     }
 
@@ -414,6 +487,87 @@ mod tests {
             InvoiceRegistry::approve(env.clone(), symbol_short!("hacker"), inv_id)
         });
         assert_eq!(err, Err(ContractError::Unauthorized));
+    }
+
+    // ── Verification ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_verify_invoice_by_granted_verifier_transitions_status() {
+        let (env, contract_addr) = setup();
+        let inv_id = symbol_short!("INV010");
+        let commitment = test_commitment(15_000, 111);
+
+        env.as_contract(&contract_addr, || {
+            InvoiceRegistry::register(
+                env.clone(),
+                inv_id.clone(),
+                commitment,
+                symbol_short!("sme1"),
+            )
+            .unwrap();
+            InvoiceRegistry::set_verifier(
+                env.clone(),
+                symbol_short!("admin"),
+                symbol_short!("ver1"),
+                true,
+            )
+            .unwrap();
+            InvoiceRegistry::verify_invoice(env.clone(), symbol_short!("ver1"), inv_id.clone())
+                .unwrap();
+        });
+
+        let invoice = env.as_contract(&contract_addr, || {
+            InvoiceRegistry::get_invoice(env.clone(), inv_id).expect("missing")
+        });
+        assert_eq!(invoice.status, InvoiceStatus::Approved);
+    }
+
+    #[test]
+    fn test_verify_invoice_non_verifier_errors() {
+        let (env, contract_addr) = setup();
+        let inv_id = symbol_short!("INV011");
+        let commitment = test_commitment(15_000, 222);
+
+        let err = env.as_contract(&contract_addr, || {
+            InvoiceRegistry::register(
+                env.clone(),
+                inv_id.clone(),
+                commitment,
+                symbol_short!("sme1"),
+            )
+            .unwrap();
+            InvoiceRegistry::verify_invoice(env.clone(), symbol_short!("rando"), inv_id)
+        });
+        assert_eq!(err, Err(ContractError::NotVerifier));
+    }
+
+    #[test]
+    fn test_verify_invoice_wrong_state_errors() {
+        let (env, contract_addr) = setup();
+        let inv_id = symbol_short!("INV012");
+        let commitment = test_commitment(15_000, 333);
+
+        let err = env.as_contract(&contract_addr, || {
+            InvoiceRegistry::register(
+                env.clone(),
+                inv_id.clone(),
+                commitment,
+                symbol_short!("sme1"),
+            )
+            .unwrap();
+            InvoiceRegistry::set_verifier(
+                env.clone(),
+                symbol_short!("admin"),
+                symbol_short!("ver1"),
+                true,
+            )
+            .unwrap();
+            InvoiceRegistry::approve(env.clone(), symbol_short!("admin"), inv_id.clone())
+                .unwrap();
+            // Already Approved — not Pending — so this must error.
+            InvoiceRegistry::verify_invoice(env.clone(), symbol_short!("ver1"), inv_id)
+        });
+        assert_eq!(err, Err(ContractError::InvalidStatus));
     }
 
     // ── Assignment ───────────────────────────────────────────────────────
