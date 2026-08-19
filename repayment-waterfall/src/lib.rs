@@ -72,6 +72,8 @@ pub enum ContractError {
     InvalidBpsSum = 5,
     /// A tier share scale could not be inverted modulo P (not coprime).
     ScaleNotInvertible = 6,
+    /// A waterfall due amount (principal/fee/reserve) was negative.
+    InvalidDueAmount = 7,
 }
 
 /// Extended Euclidean algorithm for modular inverse.
@@ -116,6 +118,22 @@ pub struct WaterfallTier {
 pub struct WaterfallResult {
     pub recipient: Symbol,
     pub commitment: i128,
+}
+
+/// Full breakdown of a priority-ordered repayment waterfall (issue #20):
+/// how much of the payment landed in each bucket, in strict order.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepaymentBreakdown {
+    /// Portion applied to principal (returned to pool capital).
+    pub principal_paid: i128,
+    /// Portion applied to the protocol fee (not forwarded to the pool).
+    pub fee_paid: i128,
+    /// Portion applied to the loss-reserve (added to pool capital).
+    pub reserve_paid: i128,
+    /// Remainder after principal/fee/reserve are covered — lender yield
+    /// (added to pool capital, uncapped).
+    pub lender_yield_paid: i128,
 }
 
 /// Tracks default volume accumulated within the current rolling 24h window
@@ -236,6 +254,88 @@ impl RepaymentWaterfall {
 
         PoolManagerClient::new(&env, &pool_manager).apply_reserve_delta(&amount);
         Ok(())
+    }
+
+    // ── Priority repayment waterfall (issue #20) ─────────────────────────
+
+    /// Routes a buyer repayment through principal -> fee -> reserve ->
+    /// lender-yield buckets, in strict priority order. Each bucket is paid
+    /// up to its `_due` amount before the next bucket sees any funds; a
+    /// partial repayment (less than the sum of all dues) simply runs out
+    /// partway through the order, so whichever bucket it stops in receives
+    /// a partial amount and every bucket after it receives zero. Any
+    /// remainder past `principal_due + fee_due + reserve_due` is lender
+    /// yield, uncapped.
+    ///
+    /// The four bucket amounts always sum to exactly `amount` (integer
+    /// arithmetic throughout — no rounding error). `principal_paid`,
+    /// `reserve_paid`, and `lender_yield_paid` are forwarded to pool-manager
+    /// as reserve credit (capital the LPs are owed); `fee_paid` is protocol
+    /// revenue and is not forwarded. Emits `RepaymentProcessed` with the
+    /// full breakdown.
+    pub fn process_repayment_waterfall(
+        env: Env,
+        amount: i128,
+        principal_due: i128,
+        fee_due: i128,
+        reserve_due: i128,
+    ) -> Result<RepaymentBreakdown, ContractError> {
+        Self::require_not_paused(&env);
+        if amount <= 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+        if principal_due < 0 || fee_due < 0 || reserve_due < 0 {
+            return Err(ContractError::InvalidDueAmount);
+        }
+
+        let mut remaining = amount;
+
+        let principal_paid = remaining.min(principal_due);
+        remaining -= principal_paid;
+
+        let fee_paid = remaining.min(fee_due);
+        remaining -= fee_paid;
+
+        let reserve_paid = remaining.min(reserve_due);
+        remaining -= reserve_paid;
+
+        // Whatever is left is lender yield — uncapped, absorbs the remainder.
+        let lender_yield_paid = remaining;
+
+        debug_assert_eq!(
+            principal_paid + fee_paid + reserve_paid + lender_yield_paid,
+            amount
+        );
+
+        let pool_manager: Address = env
+            .storage()
+            .instance()
+            .get(&POOL_MANAGER)
+            .ok_or(ContractError::PoolManagerNotConfigured)?;
+
+        let to_pool = principal_paid + reserve_paid + lender_yield_paid;
+        if to_pool > 0 {
+            PoolManagerClient::new(&env, &pool_manager).apply_reserve_delta(&to_pool);
+        }
+
+        let breakdown = RepaymentBreakdown {
+            principal_paid,
+            fee_paid,
+            reserve_paid,
+            lender_yield_paid,
+        };
+
+        env.events().publish(
+            (symbol_short!("repay_ok"),),
+            (
+                breakdown.principal_paid,
+                breakdown.fee_paid,
+                breakdown.reserve_paid,
+                breakdown.lender_yield_paid,
+            ),
+        );
+
+        Ok(breakdown)
     }
 
     /// Protocol ping — extend with domain logic.
@@ -396,6 +496,73 @@ mod tests {
             RepaymentWaterfall::process_repayment(env.clone(), 0)
         });
         assert_eq!(err, Err(ContractError::InvalidAmount));
+    }
+
+    // ── Priority repayment waterfall ────────────────────────────────────
+
+    #[test]
+    fn waterfall_full_repayment_covers_every_bucket() {
+        let (env, waterfall_addr, pool_addr) = setup();
+
+        let breakdown = env.as_contract(&waterfall_addr, || {
+            RepaymentWaterfall::process_repayment_waterfall(
+                env.clone(),
+                1_000, // amount
+                600,   // principal_due
+                100,   // fee_due
+                200,   // reserve_due
+            )
+            .unwrap()
+        });
+
+        assert_eq!(breakdown.principal_paid, 600);
+        assert_eq!(breakdown.fee_paid, 100);
+        assert_eq!(breakdown.reserve_paid, 200);
+        assert_eq!(breakdown.lender_yield_paid, 100); // 1000 - 600 - 100 - 200
+
+        // principal + reserve + lender_yield = 600 + 200 + 100 = 900 forwarded to pool.
+        env.as_contract(&pool_addr, || {
+            assert_eq!(PoolManager::total_capital(env.clone()), 100_900);
+        });
+    }
+
+    #[test]
+    fn waterfall_partial_repayment_stops_mid_bucket_no_rounding_error() {
+        let (env, waterfall_addr, _pool_addr) = setup();
+
+        let breakdown = env.as_contract(&waterfall_addr, || {
+            RepaymentWaterfall::process_repayment_waterfall(
+                env.clone(),
+                350, // amount: covers principal fully, fee partially, nothing further
+                300, // principal_due
+                100, // fee_due
+                200, // reserve_due
+            )
+            .unwrap()
+        });
+
+        assert_eq!(breakdown.principal_paid, 300);
+        assert_eq!(breakdown.fee_paid, 50);
+        assert_eq!(breakdown.reserve_paid, 0);
+        assert_eq!(breakdown.lender_yield_paid, 0);
+
+        // Zero rounding error: buckets sum to exactly the input amount.
+        assert_eq!(
+            breakdown.principal_paid
+                + breakdown.fee_paid
+                + breakdown.reserve_paid
+                + breakdown.lender_yield_paid,
+            350
+        );
+    }
+
+    #[test]
+    fn waterfall_rejects_negative_due_amount() {
+        let (env, waterfall_addr, _pool_addr) = setup();
+        let err = env.as_contract(&waterfall_addr, || {
+            RepaymentWaterfall::process_repayment_waterfall(env.clone(), 100, -1, 0, 0)
+        });
+        assert_eq!(err, Err(ContractError::InvalidDueAmount));
     }
 
     // ── circuit breaker: default surge protection ──────────────────────
