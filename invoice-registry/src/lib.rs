@@ -52,6 +52,12 @@ pub enum ContractError {
     InvoiceFrozen = 8,
     /// `verify_invoice` called by an address not granted verifier status.
     NotVerifier = 9,
+    /// `execute_upgrade`/`cancel_upgrade` called with nothing queued.
+    NoQueuedUpgrade = 10,
+    /// `execute_upgrade` was called before the timelock elapsed.
+    UpgradeTimelockNotElapsed = 11,
+    /// `execute_upgrade` was called while upgrades are emergency-paused.
+    UpgradesPaused = 12,
 }
 
 /// Per-invoice storage key.
@@ -554,6 +560,97 @@ impl InvoiceRegistry {
     }
 }
 
+/// A queued, timelocked contract-Wasm upgrade.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueuedUpgrade {
+    pub new_wasm_hash: soroban_sdk::BytesN<32>,
+    pub execute_after: u64,
+}
+
+const UPGRADE_TIMELOCK_SECS: u64 = 48 * 60 * 60;
+const QUEUED_UPGRADE: Symbol = symbol_short!("q_upgrd");
+const UPGRADE_PAUSED: Symbol = symbol_short!("up_pause");
+
+// ── upgrade (proxy upgradability pattern) ───────────────────────────────
+//
+// Separate impl block (see issue #32's PRs on the sibling contracts for the
+// full design rationale): Soroban upgrades in place via Wasm-hash swap,
+// preserving storage automatically, so that IS this platform's
+// proxy-upgrade equivalent - no separate proxy contract needed.
+#[contractimpl]
+impl InvoiceRegistry {
+    /// Queues an upgrade to `new_wasm_hash`, executable no earlier than 48h
+    /// from now. Requires the stored admin. Returns the ledger timestamp
+    /// after which it becomes executable.
+    pub fn queue_upgrade(
+        env: Env,
+        caller: Symbol,
+        new_wasm_hash: soroban_sdk::BytesN<32>,
+    ) -> Result<u64, ContractError> {
+        Self::require_admin(&env, &caller)?;
+
+        let execute_after = env.ledger().timestamp() + UPGRADE_TIMELOCK_SECS;
+        env.storage().instance().set(
+            &QUEUED_UPGRADE,
+            &QueuedUpgrade {
+                new_wasm_hash,
+                execute_after,
+            },
+        );
+        Ok(execute_after)
+    }
+
+    /// Executes the queued upgrade once its timelock has elapsed. Callable
+    /// by anyone.
+    pub fn execute_upgrade(env: Env) -> Result<(), ContractError> {
+        let paused: bool = env.storage().instance().get(&UPGRADE_PAUSED).unwrap_or(false);
+        if paused {
+            return Err(ContractError::UpgradesPaused);
+        }
+
+        let queued: QueuedUpgrade = env
+            .storage()
+            .instance()
+            .get(&QUEUED_UPGRADE)
+            .ok_or(ContractError::NoQueuedUpgrade)?;
+        if env.ledger().timestamp() < queued.execute_after {
+            return Err(ContractError::UpgradeTimelockNotElapsed);
+        }
+
+        env.storage().instance().remove(&QUEUED_UPGRADE);
+        env.deployer().update_current_contract_wasm(queued.new_wasm_hash);
+        Ok(())
+    }
+
+    /// Cancels the queued upgrade before it executes. Requires the stored
+    /// admin.
+    pub fn cancel_upgrade(env: Env, caller: Symbol) -> Result<(), ContractError> {
+        Self::require_admin(&env, &caller)?;
+        if !env.storage().instance().has(&QUEUED_UPGRADE) {
+            return Err(ContractError::NoQueuedUpgrade);
+        }
+        env.storage().instance().remove(&QUEUED_UPGRADE);
+        Ok(())
+    }
+
+    /// Sets the emergency-pause flag blocking `execute_upgrade`. Requires
+    /// the stored admin.
+    pub fn set_upgrade_paused(env: Env, caller: Symbol, paused: bool) -> Result<(), ContractError> {
+        Self::require_admin(&env, &caller)?;
+        env.storage().instance().set(&UPGRADE_PAUSED, &paused);
+        Ok(())
+    }
+
+    pub fn queued_upgrade(env: Env) -> Option<QueuedUpgrade> {
+        env.storage().instance().get(&QUEUED_UPGRADE)
+    }
+
+    pub fn is_upgrade_paused(env: Env) -> bool {
+        env.storage().instance().get(&UPGRADE_PAUSED).unwrap_or(false)
+    }
+}
+
 // Contribution check by nancy-k at 2024-11-21T23:51:43
 
 // Contribution check by oluwagbemiga at 2025-02-26T05:22:45
@@ -614,6 +711,7 @@ impl InvoiceRegistry {
 mod tests {
     use super::*;
     use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::Ledger as _;
     use soroban_sdk::{Address, Env};
 
     fn setup() -> (Env, soroban_sdk::Address) {
@@ -1138,5 +1236,84 @@ mod tests {
             // Verify amount at any stage
             assert!(InvoiceRegistry::verify_amount(env.clone(), inv_id, value, blinding).unwrap());
         });
+    }
+
+    // ── upgrade (proxy upgradability pattern) ───────────────────────────
+
+    fn dummy_wasm_hash(env: &Env) -> soroban_sdk::BytesN<32> {
+        soroban_sdk::BytesN::from_array(env, &[7u8; 32])
+    }
+
+    #[test]
+    fn queue_upgrade_requires_admin() {
+        let (env, contract_addr) = setup();
+        let hash = dummy_wasm_hash(&env);
+        let err = env.as_contract(&contract_addr, || {
+            InvoiceRegistry::queue_upgrade(env.clone(), symbol_short!("hacker"), hash)
+        });
+        assert_eq!(err, Err(ContractError::Unauthorized));
+    }
+
+    #[test]
+    fn queue_upgrade_sets_execute_after_48h_out() {
+        let (env, contract_addr) = setup();
+        let hash = dummy_wasm_hash(&env);
+
+        let (queued_at, execute_after) = env.as_contract(&contract_addr, || {
+            let now = env.ledger().timestamp();
+            let execute_after =
+                InvoiceRegistry::queue_upgrade(env.clone(), symbol_short!("admin"), hash).unwrap();
+            (now, execute_after)
+        });
+        assert_eq!(execute_after, queued_at + 48 * 60 * 60);
+    }
+
+    #[test]
+    fn execute_upgrade_before_timelock_elapses_errors() {
+        let (env, contract_addr) = setup();
+        let hash = dummy_wasm_hash(&env);
+        let err = env.as_contract(&contract_addr, || {
+            InvoiceRegistry::queue_upgrade(env.clone(), symbol_short!("admin"), hash).unwrap();
+            InvoiceRegistry::execute_upgrade(env.clone())
+        });
+        assert_eq!(err, Err(ContractError::UpgradeTimelockNotElapsed));
+    }
+
+    #[test]
+    fn execute_upgrade_with_nothing_queued_errors() {
+        let (env, contract_addr) = setup();
+        let err =
+            env.as_contract(&contract_addr, || InvoiceRegistry::execute_upgrade(env.clone()));
+        assert_eq!(err, Err(ContractError::NoQueuedUpgrade));
+    }
+
+    #[test]
+    fn cancel_upgrade_clears_the_queue() {
+        let (env, contract_addr) = setup();
+        let hash = dummy_wasm_hash(&env);
+
+        env.as_contract(&contract_addr, || {
+            InvoiceRegistry::queue_upgrade(env.clone(), symbol_short!("admin"), hash).unwrap();
+            InvoiceRegistry::cancel_upgrade(env.clone(), symbol_short!("admin")).unwrap();
+            assert!(InvoiceRegistry::queued_upgrade(env.clone()).is_none());
+        });
+    }
+
+    #[test]
+    fn execute_upgrade_while_paused_errors_even_after_timelock_elapses() {
+        let (env, contract_addr) = setup();
+        let hash = dummy_wasm_hash(&env);
+
+        env.as_contract(&contract_addr, || {
+            InvoiceRegistry::queue_upgrade(env.clone(), symbol_short!("admin"), hash).unwrap();
+            InvoiceRegistry::set_upgrade_paused(env.clone(), symbol_short!("admin"), true)
+                .unwrap();
+        });
+
+        env.ledger().with_mut(|li| li.timestamp += 48 * 60 * 60);
+
+        let err =
+            env.as_contract(&contract_addr, || InvoiceRegistry::execute_upgrade(env.clone()));
+        assert_eq!(err, Err(ContractError::UpgradesPaused));
     }
 }

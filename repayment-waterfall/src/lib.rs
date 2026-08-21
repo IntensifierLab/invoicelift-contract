@@ -74,6 +74,16 @@ pub enum ContractError {
     ScaleNotInvertible = 6,
     /// A waterfall due amount (principal/fee/reserve) was negative.
     InvalidDueAmount = 7,
+    /// Caller did not match the stored admin.
+    Unauthorized = 8,
+    /// `queue_upgrade` called before `initialize` set an admin.
+    NotInitialized = 9,
+    /// `execute_upgrade`/`cancel_upgrade` called with nothing queued.
+    NoQueuedUpgrade = 10,
+    /// `execute_upgrade` was called before the timelock elapsed.
+    UpgradeTimelockNotElapsed = 11,
+    /// `execute_upgrade` was called while upgrades are emergency-paused.
+    UpgradesPaused = 12,
 }
 
 /// Extended Euclidean algorithm for modular inverse.
@@ -450,12 +460,120 @@ impl RepaymentWaterfall {
     }
 }
 
+// A queued, timelocked contract-Wasm upgrade.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueuedUpgrade {
+    pub new_wasm_hash: soroban_sdk::BytesN<32>,
+    pub execute_after: u64,
+}
+
+const UPGRADE_TIMELOCK_SECS: u64 = 48 * 60 * 60;
+const QUEUED_UPGRADE: Symbol = symbol_short!("q_upgrd");
+const UPGRADE_PAUSED: Symbol = symbol_short!("up_pause");
+
+// ── upgrade (proxy upgradability pattern) ───────────────────────────────
+//
+// Separate impl block, same reasoning as the sibling contracts: Soroban
+// upgrades in place via Wasm-hash swap (env.deployer()
+// .update_current_contract_wasm), preserving storage automatically, so
+// that IS this platform's proxy-upgrade equivalent - no separate proxy
+// contract needed. "Storage layout migration" means the next version's
+// storage reads must stay backward-compatible with what the prior version
+// wrote, not an explicit migration step.
+#[contractimpl]
+impl RepaymentWaterfall {
+    /// Queues an upgrade to `new_wasm_hash`, executable no earlier than 48h
+    /// from now. Requires the stored admin (the caller-supplied `Symbol`
+    /// must match it). Returns the ledger timestamp after which it becomes
+    /// executable.
+    pub fn queue_upgrade(
+        env: Env,
+        admin: Symbol,
+        new_wasm_hash: soroban_sdk::BytesN<32>,
+    ) -> Result<u64, ContractError> {
+        Self::require_upgrade_admin(&env, &admin)?;
+
+        let execute_after = env.ledger().timestamp() + UPGRADE_TIMELOCK_SECS;
+        env.storage().instance().set(
+            &QUEUED_UPGRADE,
+            &QueuedUpgrade {
+                new_wasm_hash,
+                execute_after,
+            },
+        );
+        Ok(execute_after)
+    }
+
+    /// Executes the queued upgrade once its timelock has elapsed. Callable
+    /// by anyone - the outcome is fully determined by the queued state and
+    /// current ledger time.
+    pub fn execute_upgrade(env: Env) -> Result<(), ContractError> {
+        let paused: bool = env.storage().instance().get(&UPGRADE_PAUSED).unwrap_or(false);
+        if paused {
+            return Err(ContractError::UpgradesPaused);
+        }
+
+        let queued: QueuedUpgrade = env
+            .storage()
+            .instance()
+            .get(&QUEUED_UPGRADE)
+            .ok_or(ContractError::NoQueuedUpgrade)?;
+        if env.ledger().timestamp() < queued.execute_after {
+            return Err(ContractError::UpgradeTimelockNotElapsed);
+        }
+
+        env.storage().instance().remove(&QUEUED_UPGRADE);
+        env.deployer().update_current_contract_wasm(queued.new_wasm_hash);
+        Ok(())
+    }
+
+    /// Cancels the queued upgrade before it executes. Requires the stored
+    /// admin.
+    pub fn cancel_upgrade(env: Env, admin: Symbol) -> Result<(), ContractError> {
+        Self::require_upgrade_admin(&env, &admin)?;
+        if !env.storage().instance().has(&QUEUED_UPGRADE) {
+            return Err(ContractError::NoQueuedUpgrade);
+        }
+        env.storage().instance().remove(&QUEUED_UPGRADE);
+        Ok(())
+    }
+
+    /// Sets the emergency-pause flag blocking `execute_upgrade` (queueing/
+    /// cancelling still work while paused). Requires the stored admin.
+    pub fn set_upgrade_paused(env: Env, admin: Symbol, paused: bool) -> Result<(), ContractError> {
+        Self::require_upgrade_admin(&env, &admin)?;
+        env.storage().instance().set(&UPGRADE_PAUSED, &paused);
+        Ok(())
+    }
+
+    pub fn queued_upgrade(env: Env) -> Option<QueuedUpgrade> {
+        env.storage().instance().get(&QUEUED_UPGRADE)
+    }
+
+    pub fn is_upgrade_paused(env: Env) -> bool {
+        env.storage().instance().get(&UPGRADE_PAUSED).unwrap_or(false)
+    }
+
+    fn require_upgrade_admin(env: &Env, caller: &Symbol) -> Result<(), ContractError> {
+        let admin: Symbol = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("admin"))
+            .ok_or(ContractError::NotInitialized)?;
+        if *caller != admin {
+            return Err(ContractError::Unauthorized);
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use pool_manager::PoolManager;
     use soroban_sdk::symbol_short;
-    use soroban_sdk::testutils::Ledger;
+    use soroban_sdk::testutils::Ledger as _;
 
     fn setup() -> (Env, Address, Address) {
         let env = Env::default();
@@ -667,6 +785,85 @@ mod tests {
             RepaymentWaterfall::record_default(env.clone(), 1_000);
             RepaymentWaterfall::resume_processing(env.clone(), symbol_short!("not_admin"));
         });
+    }
+    // ── upgrade (proxy upgradability pattern) ───────────────────────────
+
+    fn dummy_wasm_hash(env: &Env) -> soroban_sdk::BytesN<32> {
+        soroban_sdk::BytesN::from_array(env, &[7u8; 32])
+    }
+
+    #[test]
+    fn queue_upgrade_requires_admin() {
+        let (env, waterfall_addr, _pool_addr) = setup();
+        let hash = dummy_wasm_hash(&env);
+        let err = env.as_contract(&waterfall_addr, || {
+            RepaymentWaterfall::queue_upgrade(env.clone(), symbol_short!("hacker"), hash)
+        });
+        assert_eq!(err, Err(ContractError::Unauthorized));
+    }
+
+    #[test]
+    fn queue_upgrade_sets_execute_after_48h_out() {
+        let (env, waterfall_addr, _pool_addr) = setup();
+        let hash = dummy_wasm_hash(&env);
+
+        let (queued_at, execute_after) = env.as_contract(&waterfall_addr, || {
+            let now = env.ledger().timestamp();
+            let execute_after =
+                RepaymentWaterfall::queue_upgrade(env.clone(), symbol_short!("admin"), hash)
+                    .unwrap();
+            (now, execute_after)
+        });
+        assert_eq!(execute_after, queued_at + 48 * 60 * 60);
+    }
+
+    #[test]
+    fn execute_upgrade_before_timelock_elapses_errors() {
+        let (env, waterfall_addr, _pool_addr) = setup();
+        let hash = dummy_wasm_hash(&env);
+        let err = env.as_contract(&waterfall_addr, || {
+            RepaymentWaterfall::queue_upgrade(env.clone(), symbol_short!("admin"), hash).unwrap();
+            RepaymentWaterfall::execute_upgrade(env.clone())
+        });
+        assert_eq!(err, Err(ContractError::UpgradeTimelockNotElapsed));
+    }
+
+    #[test]
+    fn execute_upgrade_with_nothing_queued_errors() {
+        let (env, waterfall_addr, _pool_addr) = setup();
+        let err =
+            env.as_contract(&waterfall_addr, || RepaymentWaterfall::execute_upgrade(env.clone()));
+        assert_eq!(err, Err(ContractError::NoQueuedUpgrade));
+    }
+
+    #[test]
+    fn cancel_upgrade_clears_the_queue() {
+        let (env, waterfall_addr, _pool_addr) = setup();
+        let hash = dummy_wasm_hash(&env);
+
+        env.as_contract(&waterfall_addr, || {
+            RepaymentWaterfall::queue_upgrade(env.clone(), symbol_short!("admin"), hash).unwrap();
+            RepaymentWaterfall::cancel_upgrade(env.clone(), symbol_short!("admin")).unwrap();
+            assert!(RepaymentWaterfall::queued_upgrade(env.clone()).is_none());
+        });
+    }
+
+    #[test]
+    fn execute_upgrade_while_paused_errors_even_after_timelock_elapses() {
+        let (env, waterfall_addr, _pool_addr) = setup();
+        let hash = dummy_wasm_hash(&env);
+
+        env.as_contract(&waterfall_addr, || {
+            RepaymentWaterfall::queue_upgrade(env.clone(), symbol_short!("admin"), hash).unwrap();
+            RepaymentWaterfall::set_upgrade_paused(env.clone(), symbol_short!("admin"), true)
+                .unwrap();
+        });
+
+        env.ledger().with_mut(|li| li.timestamp += 48 * 60 * 60);
+
+        let err =
+            env.as_contract(&waterfall_addr, || RepaymentWaterfall::execute_upgrade(env.clone()));
+        assert_eq!(err, Err(ContractError::UpgradesPaused));
     }
 }
 
