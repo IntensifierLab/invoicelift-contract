@@ -6,13 +6,16 @@
 //! are ever written on-chain. Only parties holding the opening `(value, blinding)`
 //! can verify (or prove to an auditor) the original amount.
 
+mod multisig;
 mod nft;
 mod pedersen;
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Symbol,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN,
+    Env, Symbol,
 };
 
+pub use multisig::{VerificationConfig, VerificationState};
 pub use nft::TransferRecord;
 
 // ─── Storage Keys ──────────────────────────────────────────────────────────
@@ -433,6 +436,52 @@ impl InvoiceRegistry {
     /// Contract ABI / deployment marker for integrators.
     pub fn version(_env: Env) -> u32 {
         2
+    }
+
+    // ── Multi-party verification (M-of-N signature aggregation) ───────────
+    //
+    // Requires `required` of `signers`' Ed25519 signatures before an
+    // invoice is considered verified. See `multisig` for the full design
+    // and attack-surface test suite.
+
+    /// Configure the M-of-N signer set for `invoice_id` and open a fresh
+    /// verification window. Admin-gated.
+    pub fn configure_verification(
+        env: Env,
+        caller: Symbol,
+        invoice_id: Symbol,
+        required: u32,
+        signers: soroban_sdk::Vec<BytesN<32>>,
+    ) -> Result<(), ContractError> {
+        Self::require_admin(&env, &caller)?;
+        multisig::configure(&env, invoice_id, required, signers);
+        Ok(())
+    }
+
+    /// Submit one signature over `message` from `signer_pubkey` toward
+    /// `invoice_id`'s quorum. Returns `true` if this submission reached
+    /// quorum. Anyone may call this (the signature itself is the
+    /// authorization) — see `multisig::submit_signature` for the exact
+    /// panic conditions (unknown signer, duplicate, expired, invalid sig).
+    pub fn submit_verification(
+        env: Env,
+        invoice_id: Symbol,
+        signer_pubkey: BytesN<32>,
+        message: Bytes,
+        signature: BytesN<64>,
+    ) -> bool {
+        multisig::submit_signature(&env, invoice_id, signer_pubkey, message, signature)
+    }
+
+    /// Current multi-party verification state for `invoice_id`.
+    pub fn verification_status(env: Env, invoice_id: Symbol) -> VerificationState {
+        multisig::status(&env, invoice_id)
+    }
+
+    /// Whether `invoice_id`'s verification window expired without reaching
+    /// quorum (auto-reject per the M-of-N acceptance criteria).
+    pub fn verification_expired(env: Env, invoice_id: Symbol) -> bool {
+        multisig::is_expired(&env, invoice_id)
     }
 
     // ── Internal helpers ─────────────────────────────────────────────────

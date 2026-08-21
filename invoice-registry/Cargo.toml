@@ -12,6 +12,11 @@ soroban-sdk = { workspace = true }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
+# Only used in tests, to generate real Ed25519 keypairs/signatures for the
+# multisig-verification test suite (env.crypto().ed25519_verify itself needs
+# no extra dependency at runtime - this is purely a test-side signer).
+ed25519-dalek = { version = "2.0.0", features = ["rand_core"] }
+rand = "0.8"
 
 [features]
 testutils = ["soroban-sdk/testutils"]
