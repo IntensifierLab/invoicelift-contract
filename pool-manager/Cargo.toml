@@ -12,6 +12,7 @@ soroban-sdk = { workspace = true }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
+invoice-registry = { path = "../invoice-registry", features = ["testutils"] }
 
 [features]
 testutils = ["soroban-sdk/testutils"]
