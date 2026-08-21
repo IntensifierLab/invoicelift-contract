@@ -1,7 +1,8 @@
 #![no_std]
 #[allow(unused_imports)]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, IntoVal,
+    Symbol, Vec,
 };
 
 /// Persistent storage keys.
@@ -22,6 +23,14 @@ mod storage {
     pub const ADMIN_ADDR: Symbol = symbol_short!("adm_addr");
     /// Next id to assign to a queued timelocked action.
     pub const NEXT_ACTION: Symbol = symbol_short!("nxt_act");
+
+    // ── Concentration limits (issue #19) ────────────────────────────────
+    pub const BUYER_CONC_BPS: Symbol = symbol_short!("byr_cnc");
+    pub const SME_CONC_BPS: Symbol = symbol_short!("sme_cnc");
+    /// Marker fields for `BuyerExposureKey`/`SmeExposureKey` — see those
+    /// types' doc comments for why a marker is required.
+    pub const BUYER_EXP_TAG: Symbol = symbol_short!("byr_exp");
+    pub const SME_EXP_TAG: Symbol = symbol_short!("sme_exp");
 
     // ── Pool creation config (issue #17) ────────────────────────────────
     /// Whether `create_pool` has already been called (guards duplicate config).
@@ -61,6 +70,18 @@ mod storage {
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DepositTimeKey(pub Symbol, pub Symbol);
+
+/// Per-buyer cumulative financed exposure (issue #19). See
+/// `DepositTimeKey` for why the marker field is required.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BuyerExposureKey(pub Symbol, pub Symbol);
+
+/// Per-SME cumulative financed exposure (issue #19). See `DepositTimeKey`
+/// for why the marker field is required.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SmeExposureKey(pub Symbol, pub Symbol);
 
 /// Errors surfaced by the pool manager. Stable `u32` discriminants so
 /// integrators and audit tooling can match on them.
@@ -122,6 +143,12 @@ pub enum ContractError {
     NoQueuedUpgrade = 25,
     /// `execute_upgrade` was called while emergency-paused.
     UpgradesPaused = 26,
+    /// `finance_invoice` would breach the per-buyer concentration limit.
+    BuyerConcentrationExceeded = 27,
+    /// `finance_invoice` would breach the per-SME concentration limit.
+    SmeConcentrationExceeded = 28,
+    /// A concentration-limit bps parameter was outside `(0, BPS_SCALE]`.
+    InvalidConcentrationBps = 29,
 }
 
 /// Reserve coverage floor, in basis points (500 = 5%). Rebalancing targets keeping
@@ -596,6 +623,121 @@ impl PoolManager {
         env.storage()
             .instance()
             .set(&storage::FINANCED_AMT, &new_fin);
+        Ok(())
+    }
+
+    // ── finance_invoice with concentration limits (issue #19) ───────────
+
+    /// Sets the per-buyer and per-SME concentration limits enforced by
+    /// [`Self::finance_invoice`], in basis points of total pool capital.
+    pub fn set_concentration_limits(
+        env: Env,
+        buyer_limit_bps: i128,
+        sme_limit_bps: i128,
+    ) -> Result<(), ContractError> {
+        if buyer_limit_bps <= 0 || buyer_limit_bps > BPS_SCALE {
+            return Err(ContractError::InvalidConcentrationBps);
+        }
+        if sme_limit_bps <= 0 || sme_limit_bps > BPS_SCALE {
+            return Err(ContractError::InvalidConcentrationBps);
+        }
+        env.storage()
+            .instance()
+            .set(&storage::BUYER_CONC_BPS, &buyer_limit_bps);
+        env.storage()
+            .instance()
+            .set(&storage::SME_CONC_BPS, &sme_limit_bps);
+        Ok(())
+    }
+
+    pub fn buyer_exposure(env: Env, buyer: Symbol) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&BuyerExposureKey(storage::BUYER_EXP_TAG, buyer))
+            .unwrap_or(0)
+    }
+
+    pub fn sme_exposure(env: Env, sme: Symbol) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&SmeExposureKey(storage::SME_EXP_TAG, sme))
+            .unwrap_or(0)
+    }
+
+    /// Allocates pool capital to a verified invoice, blocked if it would
+    /// breach the pool's overall utilisation cap (via [`Self::finance`]) or
+    /// either concentration limit set by [`Self::set_concentration_limits`].
+    /// On success, the invoice is assigned to this pool via a cross-contract
+    /// call into `invoice_registry`'s `assign` entrypoint, authenticated as
+    /// `registry_caller` (the identity `invoice_registry`'s admin has
+    /// authorized to transition invoices). Emits `InvoiceFinanced`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn finance_invoice(
+        env: Env,
+        buyer: Symbol,
+        sme: Symbol,
+        invoice_id: Symbol,
+        amount: i128,
+        invoice_registry: Address,
+        registry_caller: Symbol,
+    ) -> Result<(), ContractError> {
+        if amount <= 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        let tot_capital: i128 = env
+            .storage()
+            .instance()
+            .get(&storage::TOTAL_CAPITAL)
+            .unwrap_or(0);
+        let buyer_limit_bps: i128 = env
+            .storage()
+            .instance()
+            .get(&storage::BUYER_CONC_BPS)
+            .unwrap_or(BPS_SCALE);
+        let sme_limit_bps: i128 = env
+            .storage()
+            .instance()
+            .get(&storage::SME_CONC_BPS)
+            .unwrap_or(BPS_SCALE);
+
+        let buyer_key = BuyerExposureKey(storage::BUYER_EXP_TAG, buyer.clone());
+        let sme_key = SmeExposureKey(storage::SME_EXP_TAG, sme.clone());
+        let buyer_exposure: i128 = env.storage().persistent().get(&buyer_key).unwrap_or(0);
+        let sme_exposure: i128 = env.storage().persistent().get(&sme_key).unwrap_or(0);
+
+        if buyer_exposure + amount > tot_capital * buyer_limit_bps / BPS_SCALE {
+            return Err(ContractError::BuyerConcentrationExceeded);
+        }
+        if sme_exposure + amount > tot_capital * sme_limit_bps / BPS_SCALE {
+            return Err(ContractError::SmeConcentrationExceeded);
+        }
+
+        // Reuses the existing utilisation-cap check/bookkeeping.
+        Self::finance(env.clone(), amount)?;
+
+        env.storage()
+            .persistent()
+            .set(&buyer_key, &(buyer_exposure + amount));
+        env.storage()
+            .persistent()
+            .set(&sme_key, &(sme_exposure + amount));
+
+        let pool_tag: Symbol = env
+            .storage()
+            .instance()
+            .get(&storage::ADMIN)
+            .unwrap_or_else(|| symbol_short!("pool"));
+        let args: Vec<soroban_sdk::Val> = soroban_sdk::vec![
+            &env,
+            registry_caller.into_val(&env),
+            invoice_id.clone().into_val(&env),
+            pool_tag.into_val(&env),
+        ];
+        env.invoke_contract::<()>(&invoice_registry, &Symbol::new(&env, "assign"), args);
+
+        env.events()
+            .publish((symbol_short!("inv_fin"), buyer, sme), (invoice_id, amount));
         Ok(())
     }
 
@@ -1245,7 +1387,109 @@ mod tests {
             PoolManager::create_pool(env.clone(), 2_000, 1_000, 100, 1_000_000, 500)
         });
         assert_eq!(err, Err(ContractError::PoolNotInitialized));
-  }
+    }
+
+    // ── finance_invoice with concentration limits ────────────────────
+
+    use invoice_registry::{InvoiceRegistry, InvoiceStatus};
+
+    fn setup_with_registry() -> (Env, soroban_sdk::Address, soroban_sdk::Address) {
+        let (env, pool_addr) = setup();
+
+        let registry_addr = env.register_contract(None::<&Address>, InvoiceRegistry);
+        env.as_contract(&registry_addr, || {
+            InvoiceRegistry::initialize(env.clone(), symbol_short!("admin")).unwrap();
+        });
+
+        (env, pool_addr, registry_addr)
+    }
+
+    #[test]
+    fn finance_invoice_within_limits_assigns_via_cross_contract_call() {
+        let (env, pool_addr, registry_addr) = setup_with_registry();
+        let inv_id = symbol_short!("INV001");
+
+        env.as_contract(&registry_addr, || {
+            InvoiceRegistry::register(env.clone(), inv_id.clone(), 111, symbol_short!("sme1"))
+                .unwrap();
+            InvoiceRegistry::approve(env.clone(), symbol_short!("admin"), inv_id.clone())
+                .unwrap();
+        });
+
+        env.as_contract(&pool_addr, || {
+            PoolManager::deposit(env.clone(), symbol_short!("alice"), 100_000).unwrap();
+            PoolManager::set_concentration_limits(env.clone(), 5_000, 5_000).unwrap();
+            PoolManager::finance_invoice(
+                env.clone(),
+                symbol_short!("buyer1"),
+                symbol_short!("sme1"),
+                inv_id.clone(),
+                20_000,
+                registry_addr.clone(),
+                symbol_short!("admin"),
+            )
+            .unwrap();
+            assert_eq!(PoolManager::financed_amount(env.clone()), 20_000);
+            assert_eq!(
+                PoolManager::buyer_exposure(env.clone(), symbol_short!("buyer1")),
+                20_000
+            );
+            assert_eq!(
+                PoolManager::sme_exposure(env.clone(), symbol_short!("sme1")),
+                20_000
+            );
+        });
+
+        let invoice = env.as_contract(&registry_addr, || {
+            InvoiceRegistry::get_invoice(env.clone(), inv_id).expect("missing")
+        });
+        assert_eq!(invoice.status, InvoiceStatus::Assigned);
+        assert_eq!(invoice.owner, symbol_short!("admin"));
+    }
+
+    #[test]
+    fn finance_invoice_rejects_buyer_concentration_breach() {
+        let (env, pool_addr, registry_addr) = setup_with_registry();
+        let inv_id = symbol_short!("INV002");
+
+        let err = env.as_contract(&pool_addr, || {
+            PoolManager::deposit(env.clone(), symbol_short!("alice"), 100_000).unwrap();
+            PoolManager::set_concentration_limits(env.clone(), 1_000, 5_000).unwrap(); // buyer capped at 10%
+            PoolManager::finance_invoice(
+                env.clone(),
+                symbol_short!("buyer1"),
+                symbol_short!("sme1"),
+                inv_id,
+                20_000, // 20% > 10% buyer limit
+                registry_addr,
+                symbol_short!("admin"),
+            )
+        });
+        assert_eq!(err, Err(ContractError::BuyerConcentrationExceeded));
+    }
+
+    #[test]
+    fn finance_invoice_rejects_pool_utilisation_breach() {
+        let (env, pool_addr, registry_addr) = setup_with_registry();
+        let inv_id = symbol_short!("INV003");
+
+        let err = env.as_contract(&pool_addr, || {
+            PoolManager::deposit(env.clone(), symbol_short!("alice"), 10_000).unwrap();
+            PoolManager::set_concentration_limits(env.clone(), 10_000, 10_000).unwrap();
+            // Pool max_utilisation is 8_000 bps (80%) from `setup`.
+            PoolManager::finance_invoice(
+                env.clone(),
+                symbol_short!("buyer1"),
+                symbol_short!("sme1"),
+                inv_id,
+                9_000,
+                registry_addr,
+                symbol_short!("admin"),
+            )
+        });
+        assert_eq!(err, Err(ContractError::MaxUtilisationExceeded));
+    }
+
     // ── join_pool ──────────────────────────────────────────────────────
 
     #[test]
