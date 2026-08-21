@@ -84,6 +84,14 @@ pub enum ContractError {
     UpgradeTimelockNotElapsed = 11,
     /// `execute_upgrade` was called while upgrades are emergency-paused.
     UpgradesPaused = 12,
+    /// `declare_default` called for an invoice with no due date registered.
+    InvoiceDueDateNotSet = 13,
+    /// `declare_default` called for an invoice already marked defaulted.
+    InvoiceAlreadyDefaulted = 14,
+    /// `declare_default` called before the grace period has elapsed.
+    GracePeriodNotElapsed = 15,
+    /// A loss amount passed to `declare_default` was not strictly positive.
+    InvalidLossAmount = 16,
 }
 
 /// Extended Euclidean algorithm for modular inverse.
@@ -158,6 +166,36 @@ pub struct DefaultRecord {
 use soroban_sdk::{contractclient, Address};
 
 const POOL_MANAGER: Symbol = symbol_short!("pool_mgr");
+
+// ── Delinquency handling (issue #21) ────────────────────────────────────
+
+/// Grace period (seconds) applied before an overdue invoice can be
+/// declared in default. Defaults to 0 (no grace) if never configured via
+/// `set_grace_period`.
+const GRACE_SECS: Symbol = symbol_short!("grace");
+/// Marker fields for `InvoiceDueKey`/`InvoiceDefaultedKey` — see those
+/// types' doc comments for why a marker is required.
+const DUE_TAG: Symbol = symbol_short!("due_tag");
+const DEFAULT_TAG: Symbol = symbol_short!("dflt_tag");
+
+/// Per-invoice due-date storage key (issue #21): when the invoice's
+/// repayment became due, i.e. the start of the grace-period clock.
+///
+/// Carries a fixed marker as its first field: `#[contracttype]` encodes a
+/// tuple struct as a bare XDR vec of its fields with no type-name
+/// discriminant, so a single-`Symbol`-field key here would be
+/// indistinguishable on-ledger from any other single-`Symbol` key sharing
+/// the same value — the marker keeps this key's storage slot from
+/// colliding with theirs.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvoiceDueKey(pub Symbol, pub Symbol);
+
+/// Per-invoice defaulted-flag storage key (issue #21). See `InvoiceDueKey`
+/// for why the marker field is required.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvoiceDefaultedKey(pub Symbol, pub Symbol);
 
 /// Storage key for the current rolling-window `DefaultRecord`.
 const DEFAULT_RECORD: Symbol = symbol_short!("dflt_rec");
@@ -357,6 +395,93 @@ impl RepaymentWaterfall {
     /// Contract ABI / deployment marker for integrators.
     pub fn version(_env: Env) -> u32 {
         2
+    }
+
+    // ── Delinquency handling (issue #21) ─────────────────────────────────
+
+    /// Configures the grace period (seconds) applied before an overdue
+    /// invoice can be declared in default.
+    pub fn set_grace_period(env: Env, secs: u64) {
+        env.storage().instance().set(&GRACE_SECS, &secs);
+    }
+
+    pub fn grace_period(env: Env) -> u64 {
+        env.storage().instance().get(&GRACE_SECS).unwrap_or(0)
+    }
+
+    /// Registers `due_at` (ledger timestamp) as the moment `invoice_id`'s
+    /// repayment became due — the start of the grace-period clock checked
+    /// by [`Self::declare_default`].
+    pub fn mark_invoice_due(env: Env, invoice_id: Symbol, due_at: u64) {
+        env.storage()
+            .persistent()
+            .set(&InvoiceDueKey(DUE_TAG, invoice_id), &due_at);
+    }
+
+    pub fn invoice_due_at(env: Env, invoice_id: Symbol) -> Option<u64> {
+        env.storage()
+            .persistent()
+            .get(&InvoiceDueKey(DUE_TAG, invoice_id))
+    }
+
+    pub fn is_invoice_defaulted(env: Env, invoice_id: Symbol) -> bool {
+        env.storage()
+            .persistent()
+            .get(&InvoiceDefaultedKey(DEFAULT_TAG, invoice_id))
+            .unwrap_or(false)
+    }
+
+    /// Declares `invoice_id` in default once its grace period (due date +
+    /// [`Self::grace_period`]) has elapsed, applying `loss_amount` against
+    /// the pool's reserve — which reduces total capital and therefore NAV,
+    /// proportionally reducing every LP's share value. Emits
+    /// `InvoiceDefaulted`.
+    ///
+    /// Errors if `invoice_id` has no due date registered, is already
+    /// defaulted, or the grace period has not yet elapsed.
+    pub fn declare_default(
+        env: Env,
+        invoice_id: Symbol,
+        loss_amount: i128,
+    ) -> Result<(), ContractError> {
+        if loss_amount <= 0 {
+            return Err(ContractError::InvalidLossAmount);
+        }
+
+        let due_key = InvoiceDueKey(DUE_TAG, invoice_id.clone());
+        let due_at: u64 = env
+            .storage()
+            .persistent()
+            .get(&due_key)
+            .ok_or(ContractError::InvoiceDueDateNotSet)?;
+
+        let defaulted_key = InvoiceDefaultedKey(DEFAULT_TAG, invoice_id.clone());
+        if env
+            .storage()
+            .persistent()
+            .get(&defaulted_key)
+            .unwrap_or(false)
+        {
+            return Err(ContractError::InvoiceAlreadyDefaulted);
+        }
+
+        let grace_secs: u64 = env.storage().instance().get(&GRACE_SECS).unwrap_or(0);
+        if env.ledger().timestamp() < due_at + grace_secs {
+            return Err(ContractError::GracePeriodNotElapsed);
+        }
+
+        env.storage().persistent().set(&defaulted_key, &true);
+
+        let pool_manager: Address = env
+            .storage()
+            .instance()
+            .get(&POOL_MANAGER)
+            .ok_or(ContractError::PoolManagerNotConfigured)?;
+        PoolManagerClient::new(&env, &pool_manager).apply_reserve_delta(&(-loss_amount));
+
+        env.events()
+            .publish((symbol_short!("inv_dflt"),), (invoice_id, loss_amount));
+        Ok(())
     }
 
     // ── circuit breaker: default surge protection ──────────────────────
@@ -681,6 +806,78 @@ mod tests {
             RepaymentWaterfall::process_repayment_waterfall(env.clone(), 100, -1, 0, 0)
         });
         assert_eq!(err, Err(ContractError::InvalidDueAmount));
+    }
+
+    // ── Delinquency handling ─────────────────────────────────────────────
+
+    #[test]
+    fn declare_default_after_grace_period_reduces_pool_capital_and_nav() {
+        let (env, waterfall_addr, pool_addr) = setup();
+        let inv_id = symbol_short!("INV001");
+
+        env.as_contract(&waterfall_addr, || {
+            RepaymentWaterfall::set_grace_period(env.clone(), 60 * 60 * 24 * 7); // 7 days
+            RepaymentWaterfall::mark_invoice_due(env.clone(), inv_id.clone(), 1_000);
+        });
+
+        env.ledger()
+            .with_mut(|li| li.timestamp = 1_000 + 60 * 60 * 24 * 7);
+
+        env.as_contract(&waterfall_addr, || {
+            RepaymentWaterfall::declare_default(env.clone(), inv_id.clone(), 10_000).unwrap();
+            assert!(RepaymentWaterfall::is_invoice_defaulted(
+                env.clone(),
+                inv_id
+            ));
+        });
+
+        env.as_contract(&pool_addr, || {
+            assert_eq!(PoolManager::total_capital(env.clone()), 90_000);
+        });
+    }
+
+    #[test]
+    fn declare_default_before_grace_period_elapses_errors() {
+        let (env, waterfall_addr, _pool_addr) = setup();
+        let inv_id = symbol_short!("INV002");
+
+        env.as_contract(&waterfall_addr, || {
+            RepaymentWaterfall::set_grace_period(env.clone(), 60 * 60 * 24 * 7);
+            RepaymentWaterfall::mark_invoice_due(env.clone(), inv_id.clone(), 1_000);
+        });
+
+        env.ledger()
+            .with_mut(|li| li.timestamp = 1_000 + 60 * 60 * 24); // only 1 day in
+
+        let err = env.as_contract(&waterfall_addr, || {
+            RepaymentWaterfall::declare_default(env.clone(), inv_id, 10_000)
+        });
+        assert_eq!(err, Err(ContractError::GracePeriodNotElapsed));
+    }
+
+    #[test]
+    fn declare_default_twice_errors() {
+        let (env, waterfall_addr, _pool_addr) = setup();
+        let inv_id = symbol_short!("INV003");
+
+        env.as_contract(&waterfall_addr, || {
+            RepaymentWaterfall::mark_invoice_due(env.clone(), inv_id.clone(), 0);
+        });
+
+        let err = env.as_contract(&waterfall_addr, || {
+            RepaymentWaterfall::declare_default(env.clone(), inv_id.clone(), 10_000).unwrap();
+            RepaymentWaterfall::declare_default(env.clone(), inv_id, 10_000)
+        });
+        assert_eq!(err, Err(ContractError::InvoiceAlreadyDefaulted));
+    }
+
+    #[test]
+    fn declare_default_without_due_date_errors() {
+        let (env, waterfall_addr, _pool_addr) = setup();
+        let err = env.as_contract(&waterfall_addr, || {
+            RepaymentWaterfall::declare_default(env.clone(), symbol_short!("GHOST"), 10_000)
+        });
+        assert_eq!(err, Err(ContractError::InvoiceDueDateNotSet));
     }
 
     // ── circuit breaker: default surge protection ──────────────────────
