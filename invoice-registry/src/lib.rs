@@ -11,8 +11,8 @@ mod nft;
 mod pedersen;
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN,
-    Env, Symbol,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env,
+    Symbol,
 };
 
 pub use multisig::{VerificationConfig, VerificationState};
@@ -545,7 +545,10 @@ impl InvoiceRegistry {
     }
 
     /// Full on-chain transfer history for `token_id`.
-    pub fn invoice_transfer_history(env: Env, token_id: Symbol) -> soroban_sdk::Vec<TransferRecord> {
+    pub fn invoice_transfer_history(
+        env: Env,
+        token_id: Symbol,
+    ) -> soroban_sdk::Vec<TransferRecord> {
         nft::transfer_history(&env, token_id)
     }
 
@@ -604,7 +607,11 @@ impl InvoiceRegistry {
     /// Executes the queued upgrade once its timelock has elapsed. Callable
     /// by anyone.
     pub fn execute_upgrade(env: Env) -> Result<(), ContractError> {
-        let paused: bool = env.storage().instance().get(&UPGRADE_PAUSED).unwrap_or(false);
+        let paused: bool = env
+            .storage()
+            .instance()
+            .get(&UPGRADE_PAUSED)
+            .unwrap_or(false);
         if paused {
             return Err(ContractError::UpgradesPaused);
         }
@@ -619,7 +626,8 @@ impl InvoiceRegistry {
         }
 
         env.storage().instance().remove(&QUEUED_UPGRADE);
-        env.deployer().update_current_contract_wasm(queued.new_wasm_hash);
+        env.deployer()
+            .update_current_contract_wasm(queued.new_wasm_hash);
         Ok(())
     }
 
@@ -647,7 +655,10 @@ impl InvoiceRegistry {
     }
 
     pub fn is_upgrade_paused(env: Env) -> bool {
-        env.storage().instance().get(&UPGRADE_PAUSED).unwrap_or(false)
+        env.storage()
+            .instance()
+            .get(&UPGRADE_PAUSED)
+            .unwrap_or(false)
     }
 }
 
@@ -896,8 +907,7 @@ mod tests {
                 true,
             )
             .unwrap();
-            InvoiceRegistry::approve(env.clone(), symbol_short!("admin"), inv_id.clone())
-                .unwrap();
+            InvoiceRegistry::approve(env.clone(), symbol_short!("admin"), inv_id.clone()).unwrap();
             // Already Approved — not Pending — so this must error.
             InvoiceRegistry::verify_invoice(env.clone(), symbol_short!("ver1"), inv_id)
         });
@@ -1282,8 +1292,9 @@ mod tests {
     #[test]
     fn execute_upgrade_with_nothing_queued_errors() {
         let (env, contract_addr) = setup();
-        let err =
-            env.as_contract(&contract_addr, || InvoiceRegistry::execute_upgrade(env.clone()));
+        let err = env.as_contract(&contract_addr, || {
+            InvoiceRegistry::execute_upgrade(env.clone())
+        });
         assert_eq!(err, Err(ContractError::NoQueuedUpgrade));
     }
 
@@ -1306,14 +1317,14 @@ mod tests {
 
         env.as_contract(&contract_addr, || {
             InvoiceRegistry::queue_upgrade(env.clone(), symbol_short!("admin"), hash).unwrap();
-            InvoiceRegistry::set_upgrade_paused(env.clone(), symbol_short!("admin"), true)
-                .unwrap();
+            InvoiceRegistry::set_upgrade_paused(env.clone(), symbol_short!("admin"), true).unwrap();
         });
 
         env.ledger().with_mut(|li| li.timestamp += 48 * 60 * 60);
 
-        let err =
-            env.as_contract(&contract_addr, || InvoiceRegistry::execute_upgrade(env.clone()));
+        let err = env.as_contract(&contract_addr, || {
+            InvoiceRegistry::execute_upgrade(env.clone())
+        });
         assert_eq!(err, Err(ContractError::UpgradesPaused));
     }
 }
