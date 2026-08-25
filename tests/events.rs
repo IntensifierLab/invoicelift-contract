@@ -15,7 +15,7 @@ use repayment_waterfall::{RepaymentWaterfall, RepaymentWaterfallClient};
 use soroban_sdk::{
     symbol_short,
     testutils::{Address as _, Events, Ledger},
-    vec, Address, Env, IntoVal, Symbol,
+    vec, Address, Env, IntoVal,
 };
 
 const NOW: u64 = 5_000;
