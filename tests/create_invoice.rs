@@ -115,10 +115,25 @@ fn distinct_ids_do_not_collide() {
     f.create(symbol_short!("inv1"), symbol_short!("buyer1"), 42, DUE);
     f.create(symbol_short!("inv2"), symbol_short!("buyer2"), 99, DUE + 5);
 
-    assert_eq!(f.client.get_invoice(&symbol_short!("inv1")).unwrap().commitment, 42);
-    assert_eq!(f.client.get_invoice(&symbol_short!("inv2")).unwrap().commitment, 99);
     assert_eq!(
-        f.client.invoice_terms(&symbol_short!("inv2")).unwrap().buyer,
+        f.client
+            .get_invoice(&symbol_short!("inv1"))
+            .unwrap()
+            .commitment,
+        42
+    );
+    assert_eq!(
+        f.client
+            .get_invoice(&symbol_short!("inv2"))
+            .unwrap()
+            .commitment,
+        99
+    );
+    assert_eq!(
+        f.client
+            .invoice_terms(&symbol_short!("inv2"))
+            .unwrap()
+            .buyer,
         symbol_short!("buyer2")
     );
 }

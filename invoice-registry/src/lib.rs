@@ -323,10 +323,10 @@ impl InvoiceRegistry {
         Ok(())
     }
 
-    /// Commercial terms recorded by [`Self::create_invoice`], if any.
+    /// Commercial terms recorded by [`InvoiceRegistry::create_invoice`], if any.
     ///
     /// Returns `None` for invoices created through the legacy
-    /// [`Self::register`] path, which records no terms.
+    /// [`InvoiceRegistry::register`] path, which records no terms.
     pub fn invoice_terms(env: Env, id: Symbol) -> Option<InvoiceTerms> {
         env.storage()
             .persistent()
