@@ -301,6 +301,14 @@ impl RepaymentWaterfall {
             .ok_or(ContractError::PoolManagerNotConfigured)?;
 
         PoolManagerClient::new(&env, &pool_manager).apply_reserve_delta(&amount);
+
+        // Emitted after the cross-contract call, not before: if
+        // `apply_reserve_delta` traps, the whole invocation reverts and no
+        // event should have been claimed for a transfer that did not happen.
+        env.events().publish(
+            (symbol_short!("repaid"),),
+            (amount, env.ledger().timestamp()),
+        );
         Ok(())
     }
 

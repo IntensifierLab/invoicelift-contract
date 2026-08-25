@@ -226,7 +226,7 @@ impl InvoiceRegistry {
     /// granted verifier status, or [`ContractError::InvalidStatus`] if the
     /// invoice is not currently `Pending`.
     pub fn verify_invoice(env: Env, caller: Symbol, id: Symbol) -> Result<(), ContractError> {
-        if !Self::is_verifier(env.clone(), caller) {
+        if !Self::is_verifier(env.clone(), caller.clone()) {
             return Err(ContractError::NotVerifier);
         }
 
@@ -244,8 +244,13 @@ impl InvoiceRegistry {
         invoice.status = InvoiceStatus::Approved;
         env.storage().persistent().set(&key, &invoice);
 
-        env.events()
-            .publish((symbol_short!("inv_ver"),), invoice.id);
+        // The id moves to a topic so an indexer can subscribe per invoice, and
+        // the payload names *who* verified and *when* — without those an
+        // audit trail cannot answer the only two questions it is ever asked.
+        env.events().publish(
+            (symbol_short!("inv_ver"), invoice.id),
+            (caller, env.ledger().timestamp()),
+        );
         Ok(())
     }
 
@@ -306,12 +311,18 @@ impl InvoiceRegistry {
             return Err(ContractError::InvalidStatus);
         }
 
+        // Captured before the write: the point of the event is that the
+        // invoice moved *from* somewhere, and after the assignment that
+        // information is gone from storage entirely.
+        let previous_owner = invoice.owner.clone();
         invoice.status = InvoiceStatus::Assigned;
         invoice.owner = pool.clone();
         env.storage().persistent().set(&key, &invoice);
 
-        env.events()
-            .publish((symbol_short!("inv_asgn"), pool), invoice.id);
+        env.events().publish(
+            (symbol_short!("inv_asgn"), invoice.id),
+            (previous_owner, pool, env.ledger().timestamp()),
+        );
         Ok(())
     }
 
