@@ -1,8 +1,8 @@
 [package]
 name = "invoicelift-contract"
-version = "0.1.0"
-edition = "2021"
-rust-version = "1.78"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 publish = false
 
 [workspace]
@@ -14,14 +14,33 @@ members = [
     "repayment-waterfall",
 ]
 
+# Values every crate in the workspace inherits with `<field>.workspace = true`.
+# Bumping the edition or the MSRV is a single edit here rather than one per
+# crate, which is what stops the four contracts drifting apart.
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+
+# Single source of truth for dependency versions. Crates opt in with
+# `<dep>.workspace = true` and may still add their own `features` on top; a
+# version bump here reaches every crate at once, and it is no longer possible
+# for two contracts to compile against different soroban-sdk builds.
 [workspace.dependencies]
 soroban-sdk = { version = "20.5.0" }
+# Test-side only: generates real Ed25519 keypairs and signatures for the
+# multisig-verification suite. `env.crypto().ed25519_verify` itself needs no
+# extra dependency at runtime.
+ed25519-dalek = { version = "2.0.0" }
+rand = "0.8"
+# Intra-workspace path dependencies, so a crate that gains a sibling dependency
+# does not have to restate the relative path.
+invoice-registry = { path = "invoice-registry" }
+pool-manager = { path = "pool-manager" }
+repayment-waterfall = { path = "repayment-waterfall" }
 
 [patch.crates-io]
 ethnum = { path = "ethnum-1.5.0" }
-
-[workspace.package]
-rust-version = "1.78"
 
 [dev-dependencies]
 # Property-based tests for the financial arithmetic (issue #9). Pinned minor
@@ -29,6 +48,6 @@ rust-version = "1.78"
 # a run that touched no contract code.
 proptest = "1.5"
 soroban-sdk = { workspace = true, features = ["testutils"] }
-invoice-registry = { path = "invoice-registry", features = ["testutils"] }
-pool-manager = { path = "pool-manager", features = ["testutils"] }
-repayment-waterfall = { path = "repayment-waterfall", features = ["testutils"] }
+invoice-registry = { workspace = true, features = ["testutils"] }
+pool-manager = { workspace = true, features = ["testutils"] }
+repayment-waterfall = { workspace = true, features = ["testutils"] }

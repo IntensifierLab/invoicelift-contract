@@ -1,8 +1,8 @@
 [package]
 name = "invoice-registry"
-version = "0.1.0"
-edition = "2021"
-rust-version = "1.78"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -14,9 +14,10 @@ soroban-sdk = { workspace = true }
 soroban-sdk = { workspace = true, features = ["testutils"] }
 # Only used in tests, to generate real Ed25519 keypairs/signatures for the
 # multisig-verification test suite (env.crypto().ed25519_verify itself needs
-# no extra dependency at runtime - this is purely a test-side signer).
-ed25519-dalek = { version = "2.0.0", features = ["rand_core"] }
-rand = "0.8"
+# no extra dependency at runtime - this is purely a test-side signer). The
+# version lives in [workspace.dependencies]; the feature is local to this use.
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
+rand.workspace = true
 
 [features]
 testutils = ["soroban-sdk/testutils"]
