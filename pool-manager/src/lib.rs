@@ -449,8 +449,14 @@ impl PoolManager {
             &env.ledger().timestamp(),
         );
 
-        env.events()
-            .publish((symbol_short!("shr_mint"), lender), shares);
+        // `shares` alone cannot be reconciled by an indexer: shares are
+        // minted at the prevailing NAV, so without the amount and the NAV
+        // used there is no way to check the mint was priced correctly, or to
+        // rebuild a lender's cost basis from the event stream.
+        env.events().publish(
+            (symbol_short!("shr_mint"), lender),
+            (amount, shares, nav, new_tot_shares),
+        );
 
         Ok(shares)
     }
