@@ -392,9 +392,12 @@ impl RepaymentWaterfall {
         marker
     }
 
-    /// Contract ABI / deployment marker for integrators.
-    pub fn version(_env: Env) -> u32 {
-        2
+    /// Semantic version of this contract, read from `Cargo.toml` at compile
+    /// time via `CARGO_PKG_VERSION` so the published version and the on-chain
+    /// one cannot drift. Returns `soroban_sdk::String` fully qualified rather
+    /// than importing it, to leave this crate's `use` block untouched.
+    pub fn version(env: Env) -> soroban_sdk::String {
+        soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION"))
     }
 
     // ── Delinquency handling (issue #21) ─────────────────────────────────
@@ -742,6 +745,16 @@ mod tests {
     }
 
     // ── Priority repayment waterfall ────────────────────────────────────
+
+    #[test]
+    fn version_matches_the_crate_manifest() {
+        let (env, contract_id, _pool) = setup();
+        let v = env.as_contract(&contract_id, || RepaymentWaterfall::version(env.clone()));
+        assert_eq!(
+            v,
+            soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION"))
+        );
+    }
 
     #[test]
     fn waterfall_full_repayment_covers_every_bucket() {

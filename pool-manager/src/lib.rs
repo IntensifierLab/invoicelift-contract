@@ -1177,9 +1177,12 @@ impl PoolManager {
         }
     }
 
-    /// Contract ABI / deployment marker for integrators.
-    pub fn version(_env: Env) -> u32 {
-        1
+    /// Semantic version of this contract, read from `Cargo.toml` at compile
+    /// time via `CARGO_PKG_VERSION` so the published version and the on-chain
+    /// one cannot drift. Returns `soroban_sdk::String` fully qualified rather
+    /// than importing it, to leave this crate's `use` block untouched.
+    pub fn version(env: Env) -> soroban_sdk::String {
+        soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION"))
     }
 
     // ── upgrade (proxy upgradability pattern) ───────────────────────────
@@ -1491,6 +1494,16 @@ mod tests {
     }
 
     // ── join_pool ──────────────────────────────────────────────────────
+
+    #[test]
+    fn version_matches_the_crate_manifest() {
+        let (env, contract_id) = setup();
+        let v = env.as_contract(&contract_id, || PoolManager::version(env.clone()));
+        assert_eq!(
+            v,
+            soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION"))
+        );
+    }
 
     #[test]
     fn join_pool_first_deposit_prices_shares_one_to_one() {
