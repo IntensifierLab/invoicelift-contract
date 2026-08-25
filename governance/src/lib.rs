@@ -312,10 +312,31 @@ impl Governance {
 
     // ── view helpers ──────────────────────────────────────────────────
 
+    /// Reads a proposal by id.
+    ///
+    /// # Arguments
+    /// * `proposal_id` — id returned by the call that created the proposal.
+    ///
+    /// # Returns
+    /// The stored [`Proposal`], including its current tallies and status.
+    ///
+    /// # Errors
+    /// [`ContractError::ProposalNotFound`] if no proposal has that id.
     pub fn get_proposal(env: Env, proposal_id: u32) -> Result<Proposal, ContractError> {
         Self::read_proposal(&env, proposal_id)
     }
 
+    /// Voting power currently credited to one voter.
+    ///
+    /// # Arguments
+    /// * `voter` — the address to look up.
+    ///
+    /// # Returns
+    /// The voter's power, or `0` if the address has never been credited any.
+    /// An unknown address and a deliberately zeroed one are indistinguishable
+    /// here by design — both have no say in a vote.
+    ///
+    /// Never panics.
     pub fn get_voting_power(env: Env, voter: Address) -> i128 {
         env.storage()
             .persistent()
@@ -323,6 +344,14 @@ impl Governance {
             .unwrap_or(0)
     }
 
+    /// Total voting power issued across all voters.
+    ///
+    /// # Returns
+    /// The running total, or `0` before any power has been granted. This is
+    /// the denominator quorum is measured against, so it moves whenever power
+    /// is granted or revoked.
+    ///
+    /// Never panics.
     pub fn total_voting_power(env: Env) -> i128 {
         env.storage()
             .instance()
