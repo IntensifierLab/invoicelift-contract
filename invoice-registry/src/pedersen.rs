@@ -230,7 +230,7 @@ mod tests {
         let v: i128 = i128::MAX / 4;
         let r: i128 = i128::MAX / 8;
         let c = commit(v, r);
-        assert!(c >= 0 && c < P);
+        assert!((0..P).contains(&c));
     }
 
     #[test]

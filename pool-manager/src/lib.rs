@@ -262,7 +262,7 @@ impl PoolManager {
         if sme_limit_bps <= 0 || sme_limit_bps > BPS_SCALE {
             return Err(ContractError::InvalidBps);
         }
-        if reserve_ratio_bps < 0 || reserve_ratio_bps > BPS_SCALE {
+        if !(0..=BPS_SCALE).contains(&reserve_ratio_bps) {
             return Err(ContractError::InvalidBps);
         }
         if min_deposit <= 0 || min_deposit > max_deposit {
@@ -288,7 +288,13 @@ impl PoolManager {
 
         env.events().publish(
             (symbol_short!("pool_new"),),
-            (buyer_limit_bps, sme_limit_bps, min_deposit, max_deposit, reserve_ratio_bps),
+            (
+                buyer_limit_bps,
+                sme_limit_bps,
+                min_deposit,
+                max_deposit,
+                reserve_ratio_bps,
+            ),
         );
         Ok(())
     }
@@ -472,7 +478,11 @@ impl PoolManager {
             return Err(ContractError::InvalidShares);
         }
 
-        let lock_secs: u64 = env.storage().instance().get(&storage::LOCK_SECS).unwrap_or(0);
+        let lock_secs: u64 = env
+            .storage()
+            .instance()
+            .get(&storage::LOCK_SECS)
+            .unwrap_or(0);
         if lock_secs > 0 {
             if let Some(deposited_at) = env
                 .storage()
@@ -576,7 +586,10 @@ impl PoolManager {
     }
 
     pub fn lock_period(env: Env) -> u64 {
-        env.storage().instance().get(&storage::LOCK_SECS).unwrap_or(0)
+        env.storage()
+            .instance()
+            .get(&storage::LOCK_SECS)
+            .unwrap_or(0)
     }
 
     /// Configures the pool-utilisation bps threshold above which withdrawals
@@ -1215,7 +1228,10 @@ impl PoolManager {
     /// from now (`TIMELOCK_SECS`, same delay as parameter changes). Requires
     /// the timelock admin's authorization. Returns the ledger timestamp
     /// after which it becomes executable.
-    pub fn queue_upgrade(env: Env, new_wasm_hash: soroban_sdk::BytesN<32>) -> Result<u64, ContractError> {
+    pub fn queue_upgrade(
+        env: Env,
+        new_wasm_hash: soroban_sdk::BytesN<32>,
+    ) -> Result<u64, ContractError> {
         Self::require_timelock_admin(&env)?;
 
         let execute_after = env.ledger().timestamp() + TIMELOCK_SECS;
@@ -1275,7 +1291,9 @@ impl PoolManager {
     /// is held back). Requires the timelock admin's authorization.
     pub fn set_upgrade_paused(env: Env, paused: bool) -> Result<(), ContractError> {
         Self::require_timelock_admin(&env)?;
-        env.storage().instance().set(&storage::UPGRADE_PAUSED, &paused);
+        env.storage()
+            .instance()
+            .set(&storage::UPGRADE_PAUSED, &paused);
         Ok(())
     }
 
@@ -1421,8 +1439,7 @@ mod tests {
         env.as_contract(&registry_addr, || {
             InvoiceRegistry::register(env.clone(), inv_id.clone(), 111, symbol_short!("sme1"))
                 .unwrap();
-            InvoiceRegistry::approve(env.clone(), symbol_short!("admin"), inv_id.clone())
-                .unwrap();
+            InvoiceRegistry::approve(env.clone(), symbol_short!("admin"), inv_id.clone()).unwrap();
         });
 
         env.as_contract(&pool_addr, || {
@@ -2201,7 +2218,9 @@ mod tests {
     fn queue_upgrade_requires_timelock_admin() {
         let (env, contract_addr) = setup();
         let hash = dummy_wasm_hash(&env);
-        let err = env.as_contract(&contract_addr, || PoolManager::queue_upgrade(env.clone(), hash));
+        let err = env.as_contract(&contract_addr, || {
+            PoolManager::queue_upgrade(env.clone(), hash)
+        });
         assert_eq!(err, Err(ContractError::TimelockAdminNotSet));
     }
 

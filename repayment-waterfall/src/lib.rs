@@ -645,7 +645,11 @@ impl RepaymentWaterfall {
     /// by anyone - the outcome is fully determined by the queued state and
     /// current ledger time.
     pub fn execute_upgrade(env: Env) -> Result<(), ContractError> {
-        let paused: bool = env.storage().instance().get(&UPGRADE_PAUSED).unwrap_or(false);
+        let paused: bool = env
+            .storage()
+            .instance()
+            .get(&UPGRADE_PAUSED)
+            .unwrap_or(false);
         if paused {
             return Err(ContractError::UpgradesPaused);
         }
@@ -660,7 +664,8 @@ impl RepaymentWaterfall {
         }
 
         env.storage().instance().remove(&QUEUED_UPGRADE);
-        env.deployer().update_current_contract_wasm(queued.new_wasm_hash);
+        env.deployer()
+            .update_current_contract_wasm(queued.new_wasm_hash);
         Ok(())
     }
 
@@ -688,7 +693,10 @@ impl RepaymentWaterfall {
     }
 
     pub fn is_upgrade_paused(env: Env) -> bool {
-        env.storage().instance().get(&UPGRADE_PAUSED).unwrap_or(false)
+        env.storage()
+            .instance()
+            .get(&UPGRADE_PAUSED)
+            .unwrap_or(false)
     }
 
     fn require_upgrade_admin(env: &Env, caller: &Symbol) -> Result<(), ContractError> {
@@ -910,7 +918,10 @@ mod tests {
         env.as_contract(&waterfall_addr, || {
             RepaymentWaterfall::record_default(env.clone(), 1_000);
             RepaymentWaterfall::record_default(env.clone(), 2_000);
-            assert_eq!(RepaymentWaterfall::current_default_volume(env.clone()), 3_000);
+            assert_eq!(
+                RepaymentWaterfall::current_default_volume(env.clone()),
+                3_000
+            );
             assert!(!RepaymentWaterfall::circuit_breaker_active(env.clone()));
         });
     }
@@ -1049,8 +1060,9 @@ mod tests {
     #[test]
     fn execute_upgrade_with_nothing_queued_errors() {
         let (env, waterfall_addr, _pool_addr) = setup();
-        let err =
-            env.as_contract(&waterfall_addr, || RepaymentWaterfall::execute_upgrade(env.clone()));
+        let err = env.as_contract(&waterfall_addr, || {
+            RepaymentWaterfall::execute_upgrade(env.clone())
+        });
         assert_eq!(err, Err(ContractError::NoQueuedUpgrade));
     }
 
@@ -1079,8 +1091,9 @@ mod tests {
 
         env.ledger().with_mut(|li| li.timestamp += 48 * 60 * 60);
 
-        let err =
-            env.as_contract(&waterfall_addr, || RepaymentWaterfall::execute_upgrade(env.clone()));
+        let err = env.as_contract(&waterfall_addr, || {
+            RepaymentWaterfall::execute_upgrade(env.clone())
+        });
         assert_eq!(err, Err(ContractError::UpgradesPaused));
     }
 }
