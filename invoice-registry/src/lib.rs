@@ -23,6 +23,7 @@ pub use nft::TransferRecord;
 mod storage {
     use soroban_sdk::{symbol_short, Symbol};
 
+    /// Instance-storage tag holding the registry admin.
     pub const ADMIN: Symbol = symbol_short!("admin");
     /// Marker field for `VerifierKey` — see that type's doc comment for why.
     pub const VERIFIER_TAG: Symbol = symbol_short!("verifier");
@@ -322,10 +323,10 @@ impl InvoiceRegistry {
         Ok(())
     }
 
-    /// Commercial terms recorded by [`Self::create_invoice`], if any.
+    /// Commercial terms recorded by [`InvoiceRegistry::create_invoice`], if any.
     ///
     /// Returns `None` for invoices created through the legacy
-    /// [`Self::register`] path, which records no terms.
+    /// [`InvoiceRegistry::register`] path, which records no terms.
     pub fn invoice_terms(env: Env, id: Symbol) -> Option<InvoiceTerms> {
         env.storage()
             .persistent()
@@ -358,7 +359,7 @@ impl InvoiceRegistry {
     // ── Verification (issue #14) ────────────────────────────────────────
 
     /// Admin grants (or revokes) verifier status for `verifier`. Only
-    /// addresses granted verifier status may call [`Self::verify_invoice`].
+    /// addresses granted verifier status may call [`InvoiceRegistry::verify_invoice`].
     pub fn set_verifier(
         env: Env,
         caller: Symbol,
@@ -380,9 +381,9 @@ impl InvoiceRegistry {
             .unwrap_or(false)
     }
 
-    /// A verifier (granted via [`Self::set_verifier`]) verifies a pending
+    /// A verifier (granted via [`InvoiceRegistry::set_verifier`]) verifies a pending
     /// invoice (Pending → Approved). This is a separate entrypoint from
-    /// [`Self::approve`] so verification duties can be delegated to a set of
+    /// [`InvoiceRegistry::approve`] so verification duties can be delegated to a set of
     /// verifiers distinct from the contract admin.
     ///
     /// Returns [`ContractError::NotVerifier`] if the caller was never
@@ -515,7 +516,7 @@ impl InvoiceRegistry {
     // ── Fraud flag & freeze (issue #16) ─────────────────────────────────
 
     /// Admin marks an invoice as suspicious. Informational only — does not
-    /// block transitions on its own; pair with [`Self::freeze_invoice`] to
+    /// block transitions on its own; pair with [`InvoiceRegistry::freeze_invoice`] to
     /// actually halt the invoice.
     pub fn flag_invoice(env: Env, caller: Symbol, id: Symbol) -> Result<(), ContractError> {
         Self::require_admin(&env, &caller)?;
@@ -827,10 +828,25 @@ impl InvoiceRegistry {
         Ok(())
     }
 
+    /// The upgrade currently waiting out its timelock, if any.
+    ///
+    /// # Returns
+    /// `Some(QueuedUpgrade)` with the pending Wasm hash and the earliest
+    /// timestamp it may be executed at, or `None` when nothing is queued.
+    ///
+    /// Never panics — callers poll this to decide whether an upgrade is due.
     pub fn queued_upgrade(env: Env) -> Option<QueuedUpgrade> {
         env.storage().instance().get(&QUEUED_UPGRADE)
     }
 
+    /// Whether the final Wasm swap is currently held back.
+    ///
+    /// # Returns
+    /// `true` while upgrades are paused, `false` otherwise (the default).
+    /// Queueing and cancelling still work while paused — only execution is
+    /// blocked — so a `true` here does not mean nothing is pending.
+    ///
+    /// Never panics.
     pub fn is_upgrade_paused(env: Env) -> bool {
         env.storage()
             .instance()

@@ -15,7 +15,7 @@ use repayment_waterfall::{RepaymentWaterfall, RepaymentWaterfallClient};
 use soroban_sdk::{
     symbol_short,
     testutils::{Address as _, Events, Ledger},
-    vec, Address, Env, IntoVal, Symbol,
+    vec, Address, Env, IntoVal,
 };
 
 const NOW: u64 = 5_000;
@@ -77,7 +77,11 @@ fn assign_invoice_emits_the_owner_it_moved_from() {
     registry.verify_invoice(&symbol_short!("ver1"), &symbol_short!("inv1"));
 
     let pool_manager = Address::generate(&env);
-    registry.assign_invoice(&pool_manager, &symbol_short!("inv1"), &symbol_short!("pool1"));
+    registry.assign_invoice(
+        &pool_manager,
+        &symbol_short!("inv1"),
+        &symbol_short!("pool1"),
+    );
 
     let events = env.events().all();
     let last = events.last().expect("assign_invoice should emit an event");
@@ -148,7 +152,13 @@ fn join_pool_event_carries_the_running_share_total() {
             (
                 id.clone(),
                 (symbol_short!("shr_mint"), second.clone()).into_val(&env),
-                (500i128, second_shares, pool.nav(), first_shares + second_shares).into_val(&env),
+                (
+                    500i128,
+                    second_shares,
+                    pool.nav(),
+                    first_shares + second_shares
+                )
+                    .into_val(&env),
             ),
         ]
     );

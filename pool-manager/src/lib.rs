@@ -9,11 +9,17 @@ use soroban_sdk::{
 mod storage {
     use soroban_sdk::{symbol_short, Symbol};
 
+    /// Legacy `Symbol` admin tag. See `ADMIN_ADDR` for the authenticable one.
     pub const ADMIN: Symbol = symbol_short!("admin");
+    /// Sum of all lender shares outstanding.
     pub const TOTAL_SHARES: Symbol = symbol_short!("tot_sh");
+    /// Pool capital, in token units: `TOTAL_SHARES * NAV / NAV_SCALE`.
     pub const TOTAL_CAPITAL: Symbol = symbol_short!("tot_ca");
+    /// Capital currently deployed against financed invoices.
     pub const FINANCED_AMT: Symbol = symbol_short!("fin_am");
+    /// Utilisation ceiling, in bps, that `FINANCED_AMT` may not exceed.
     pub const MAX_UTIL: Symbol = symbol_short!("max_ut");
+    /// Net asset value per share, scaled by `NAV_SCALE`.
     pub const NAV: Symbol = symbol_short!("nav");
     /// Governance flag: excludes this pool from being picked as a rebalancing donor.
     pub const DONOR_BLK: Symbol = symbol_short!("dnr_blk");
@@ -25,20 +31,29 @@ mod storage {
     pub const NEXT_ACTION: Symbol = symbol_short!("nxt_act");
 
     // ── Concentration limits (issue #19) ────────────────────────────────
+    /// Per-buyer concentration ceiling, in bps of pool capital.
     pub const BUYER_CONC_BPS: Symbol = symbol_short!("byr_cnc");
+    /// Per-SME concentration ceiling, in bps of pool capital.
     pub const SME_CONC_BPS: Symbol = symbol_short!("sme_cnc");
-    /// Marker fields for `BuyerExposureKey`/`SmeExposureKey` — see those
-    /// types' doc comments for why a marker is required.
+    /// Marker field for `BuyerExposureKey` — see that type's doc comment for
+    /// why a marker is required.
     pub const BUYER_EXP_TAG: Symbol = symbol_short!("byr_exp");
+    /// Marker field for `SmeExposureKey` — see that type's doc comment for
+    /// why a marker is required.
     pub const SME_EXP_TAG: Symbol = symbol_short!("sme_exp");
 
     // ── Pool creation config (issue #17) ────────────────────────────────
     /// Whether `create_pool` has already been called (guards duplicate config).
     pub const POOL_CFG_SET: Symbol = symbol_short!("pl_cfg");
+    /// Buyer exposure limit fixed at pool creation, in bps.
     pub const BUYER_LIMIT_BPS: Symbol = symbol_short!("buy_lim");
+    /// SME exposure limit fixed at pool creation, in bps.
     pub const SME_LIMIT_BPS: Symbol = symbol_short!("sme_lim");
+    /// Smallest accepted single deposit.
     pub const MIN_DEPOSIT: Symbol = symbol_short!("min_dep");
+    /// Largest accepted single deposit.
     pub const MAX_DEPOSIT: Symbol = symbol_short!("max_dep");
+    /// Share of capital, in bps, kept idle as reserve.
     pub const RESERVE_RATIO_BPS: Symbol = symbol_short!("rsv_rat");
 
     // ── Withdrawal lock period (issue #22) ──────────────────────────────
@@ -299,6 +314,14 @@ impl PoolManager {
         Ok(())
     }
 
+    /// Per-buyer exposure limit fixed at pool creation, in basis points.
+    ///
+    /// # Returns
+    /// The configured limit, or `0` if `create_pool` has not run yet.
+    ///
+    /// A `0` therefore means *unconfigured*, not *no exposure allowed*.
+    ///
+    /// Never panics.
     pub fn buyer_limit_bps(env: Env) -> i128 {
         env.storage()
             .instance()
@@ -306,6 +329,12 @@ impl PoolManager {
             .unwrap_or(0)
     }
 
+    /// Per-SME exposure limit fixed at pool creation, in basis points.
+    ///
+    /// # Returns
+    /// The configured limit, or `0` if `create_pool` has not run yet.
+    ///
+    /// Never panics.
     pub fn sme_limit_bps(env: Env) -> i128 {
         env.storage()
             .instance()
@@ -313,6 +342,12 @@ impl PoolManager {
             .unwrap_or(0)
     }
 
+    /// Smallest deposit the pool accepts, in token units.
+    ///
+    /// # Returns
+    /// The configured minimum, or `0` (no floor) when unconfigured.
+    ///
+    /// Never panics.
     pub fn min_deposit(env: Env) -> i128 {
         env.storage()
             .instance()
@@ -320,6 +355,13 @@ impl PoolManager {
             .unwrap_or(0)
     }
 
+    /// Largest deposit the pool accepts, in token units.
+    ///
+    /// # Returns
+    /// The configured maximum, or `0` when unconfigured. Callers must read `0`
+    /// as *unset* rather than as a ceiling of zero.
+    ///
+    /// Never panics.
     pub fn max_deposit(env: Env) -> i128 {
         env.storage()
             .instance()
@@ -327,6 +369,12 @@ impl PoolManager {
             .unwrap_or(0)
     }
 
+    /// Share of capital held back as reserve, in basis points.
+    ///
+    /// # Returns
+    /// The configured ratio, or `0` when unconfigured.
+    ///
+    /// Never panics.
     pub fn reserve_ratio_bps(env: Env) -> i128 {
         env.storage()
             .instance()
@@ -398,7 +446,7 @@ impl PoolManager {
     /// mint at the current NAV. Emits `SharesMinted` and returns the number
     /// of shares minted.
     ///
-    /// Ledger accounting is shared with [`Self::deposit`] (same NAV math,
+    /// Ledger accounting is shared with [`PoolManager::deposit`] (same NAV math,
     /// same `LenderPosition`/totals storage) — this is an additive,
     /// auth-checked entrypoint alongside it, keyed by the lender's `Symbol`
     /// tag derived from their address so both entrypoints stay consistent
@@ -585,6 +633,14 @@ impl PoolManager {
         env.storage().instance().set(&storage::LOCK_SECS, &secs);
     }
 
+    /// How long a deposit must sit before it can be withdrawn, in seconds.
+    ///
+    /// # Returns
+    /// The configured lock, or `0` meaning withdrawals are never time-locked.
+    ///
+    /// Set by [`PoolManager::set_lock_period`].
+    ///
+    /// Never panics.
     pub fn lock_period(env: Env) -> u64 {
         env.storage()
             .instance()
@@ -604,6 +660,15 @@ impl PoolManager {
         Ok(())
     }
 
+    /// Utilisation level above which withdrawals are refused, in basis points.
+    ///
+    /// # Returns
+    /// The configured threshold, or `BPS_SCALE` (100%) when unset — the
+    /// permissive default, under which utilisation never blocks a withdrawal.
+    ///
+    /// Set by [`PoolManager::set_withdraw_util_threshold`].
+    ///
+    /// Never panics.
     pub fn withdraw_util_threshold(env: Env) -> i128 {
         env.storage()
             .instance()
@@ -648,7 +713,7 @@ impl PoolManager {
     // ── finance_invoice with concentration limits (issue #19) ───────────
 
     /// Sets the per-buyer and per-SME concentration limits enforced by
-    /// [`Self::finance_invoice`], in basis points of total pool capital.
+    /// [`PoolManager::finance_invoice`], in basis points of total pool capital.
     pub fn set_concentration_limits(
         env: Env,
         buyer_limit_bps: i128,
@@ -669,6 +734,15 @@ impl PoolManager {
         Ok(())
     }
 
+    /// Capital currently at risk against one buyer.
+    ///
+    /// # Arguments
+    /// * `buyer` — the buyer's symbol tag.
+    ///
+    /// # Returns
+    /// The outstanding exposure, or `0` for a buyer the pool has never financed.
+    ///
+    /// Never panics.
     pub fn buyer_exposure(env: Env, buyer: Symbol) -> i128 {
         env.storage()
             .persistent()
@@ -676,6 +750,15 @@ impl PoolManager {
             .unwrap_or(0)
     }
 
+    /// Capital currently at risk against one SME.
+    ///
+    /// # Arguments
+    /// * `sme` — the SME's symbol tag.
+    ///
+    /// # Returns
+    /// The outstanding exposure, or `0` for an SME the pool has never financed.
+    ///
+    /// Never panics.
     pub fn sme_exposure(env: Env, sme: Symbol) -> i128 {
         env.storage()
             .persistent()
@@ -684,8 +767,8 @@ impl PoolManager {
     }
 
     /// Allocates pool capital to a verified invoice, blocked if it would
-    /// breach the pool's overall utilisation cap (via [`Self::finance`]) or
-    /// either concentration limit set by [`Self::set_concentration_limits`].
+    /// breach the pool's overall utilisation cap (via [`PoolManager::finance`]) or
+    /// either concentration limit set by [`PoolManager::set_concentration_limits`].
     /// On success, the invoice is assigned to this pool via a cross-contract
     /// call into `invoice_registry`'s `assign` entrypoint, authenticated as
     /// `registry_caller` (the identity `invoice_registry`'s admin has
@@ -800,6 +883,13 @@ impl PoolManager {
 
     // ── view helpers ──────────────────────────────────────────────────
 
+    /// Total lender shares outstanding.
+    ///
+    /// # Returns
+    /// The share count, or `0` for an empty pool. Paired with [`PoolManager::nav`] this
+    /// gives total capital: `total_shares * nav / NAV_SCALE`.
+    ///
+    /// Never panics.
     pub fn total_shares(env: Env) -> i128 {
         env.storage()
             .instance()
@@ -815,6 +905,13 @@ impl PoolManager {
             .unwrap_or(0)
     }
 
+    /// Capital currently deployed against financed invoices.
+    ///
+    /// # Returns
+    /// The financed total, or `0` when nothing is outstanding. Bounded by
+    /// [`PoolManager::max_utilisation`] on every financing path.
+    ///
+    /// Never panics.
     pub fn financed_amount(env: Env) -> i128 {
         env.storage()
             .instance()
@@ -822,6 +919,12 @@ impl PoolManager {
             .unwrap_or(0)
     }
 
+    /// Utilisation ceiling for the pool, in basis points.
+    ///
+    /// # Returns
+    /// The configured cap, or `0` if it has never been set.
+    ///
+    /// Never panics.
     pub fn max_utilisation(env: Env) -> i128 {
         env.storage()
             .instance()
@@ -829,6 +932,13 @@ impl PoolManager {
             .unwrap_or(0)
     }
 
+    /// Net asset value per share, scaled by `NAV_SCALE`.
+    ///
+    /// # Returns
+    /// The current NAV, defaulting to `NAV_SCALE` (parity, 1.0) for a pool that
+    /// has not yet taken a gain or loss.
+    ///
+    /// Never panics.
     pub fn nav(env: Env) -> i128 {
         env.storage()
             .instance()
@@ -836,6 +946,15 @@ impl PoolManager {
             .unwrap_or(NAV_SCALE)
     }
 
+    /// Shares held by one lender.
+    ///
+    /// # Arguments
+    /// * `lender` — the lender's symbol tag.
+    ///
+    /// # Returns
+    /// The lender's share balance, or `0` for an unknown or fully exited lender.
+    ///
+    /// Never panics.
     pub fn lender_shares(env: Env, lender: Symbol) -> i128 {
         let key = LenderKey(lender);
         let pos: LenderPosition = env
@@ -866,6 +985,14 @@ impl PoolManager {
         env.storage().instance().set(&storage::DONOR_BLK, &blocked);
     }
 
+    /// Whether this pool is excluded from being picked as a rebalancing donor.
+    ///
+    /// # Returns
+    /// `true` if excluded, `false` otherwise (the default).
+    ///
+    /// Set by [`PoolManager::set_donor_blocked`].
+    ///
+    /// Never panics.
     pub fn is_donor_blocked(env: Env) -> bool {
         env.storage()
             .instance()
@@ -1144,10 +1271,29 @@ impl PoolManager {
         Ok(())
     }
 
+    /// Reads a timelocked admin action by id.
+    ///
+    /// # Arguments
+    /// * `id` — id assigned when the action was queued.
+    ///
+    /// # Returns
+    /// `Some(QueuedAction)` if one exists under that id — including actions
+    /// already executed or cancelled, whose flags say so — or `None` if the id
+    /// was never issued.
+    ///
+    /// Never panics.
     pub fn get_queued_action(env: Env, id: u32) -> Option<QueuedAction> {
         env.storage().persistent().get(&ActionKey(id))
     }
 
+    /// The address authorized to queue and cancel timelocked actions.
+    ///
+    /// # Returns
+    /// `Some(Address)` once set, or `None` before the timelock admin is
+    /// installed. Distinct from the legacy `ADMIN` symbol tag: this one is a
+    /// real address and can be checked with `require_auth`.
+    ///
+    /// Never panics.
     pub fn timelock_admin(env: Env) -> Option<Address> {
         env.storage().instance().get(&storage::ADMIN_ADDR)
     }
@@ -1297,10 +1443,26 @@ impl PoolManager {
         Ok(())
     }
 
+    /// The upgrade currently waiting out its timelock, if any.
+    ///
+    /// # Returns
+    /// `Some(QueuedUpgrade)` with the pending Wasm hash and the earliest
+    /// timestamp it may execute at, or `None` when nothing is queued.
+    ///
+    /// Never panics.
     pub fn queued_upgrade(env: Env) -> Option<QueuedUpgrade> {
         env.storage().instance().get(&storage::QUEUED_UPGRADE)
     }
 
+    /// Whether the final Wasm swap is currently held back.
+    ///
+    /// # Returns
+    /// `true` while upgrades are paused, `false` otherwise (the default).
+    ///
+    /// Queueing and cancelling still work while paused — only execution is
+    /// blocked — so `true` here does not mean nothing is pending.
+    ///
+    /// Never panics.
     pub fn is_upgrade_paused(env: Env) -> bool {
         env.storage()
             .instance()

@@ -51,3 +51,23 @@ soroban-sdk = { workspace = true, features = ["testutils"] }
 invoice-registry = { workspace = true, features = ["testutils"] }
 pool-manager = { workspace = true, features = ["testutils"] }
 repayment-waterfall = { workspace = true, features = ["testutils"] }
+
+# Release profile for the deployable Wasm artifacts.
+#
+# Without these, the contracts build with the default `release` profile, which
+# optimises for speed and keeps symbols — pool_manager was 65,502 bytes against
+# the CI's 65,536-byte ceiling, i.e. 34 bytes of headroom, so any change at all
+# broke the size check. `opt-level = "z"` plus LTO, a single codegen unit and
+# stripped symbols is the standard Soroban contract profile.
+#
+# `overflow-checks` stays on deliberately: silent wrapping in financial
+# arithmetic is worth far more than the bytes it costs.
+[profile.release]
+opt-level = "z"
+overflow-checks = true
+debug = 0
+strip = "symbols"
+debug-assertions = false
+panic = "abort"
+codegen-units = 1
+lto = true

@@ -124,17 +124,30 @@ fn scale_commitment(c: i128, scalar: i128, scale: i128) -> Result<i128, Contract
     Ok(mod_mul(scaled, inv, P))
 }
 
+/// One rung of a repayment waterfall: who gets paid, and what share.
+///
+/// Tiers are consumed in strict priority order, so position in the list
+/// matters as much as `share_bps` — an earlier tier is made whole before a
+/// later one sees anything.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WaterfallTier {
+    /// Symbol tag of the party paid at this tier.
     pub recipient: Symbol,
+    /// This tier's claim, in basis points.
     pub share_bps: i128,
 }
 
+/// What one tier is owed once a waterfall has been computed.
+///
+/// The counterpart to [`WaterfallTier`]: the tier states a share, this states
+/// the amount that share resolved to for a specific payment.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WaterfallResult {
+    /// Symbol tag of the party paid at this tier.
     pub recipient: Symbol,
+    /// Amount committed to this recipient, in token units.
     pub commitment: i128,
 }
 
@@ -416,25 +429,57 @@ impl RepaymentWaterfall {
         env.storage().instance().set(&GRACE_SECS, &secs);
     }
 
+    /// Grace period applied before an overdue invoice can be defaulted.
+    ///
+    /// # Returns
+    /// The configured period in seconds, or `0` when unset — meaning an
+    /// invoice may be declared in default the moment it is overdue.
+    ///
+    /// Set by [`RepaymentWaterfall::set_grace_period`].
+    ///
+    /// Never panics.
     pub fn grace_period(env: Env) -> u64 {
         env.storage().instance().get(&GRACE_SECS).unwrap_or(0)
     }
 
     /// Registers `due_at` (ledger timestamp) as the moment `invoice_id`'s
     /// repayment became due — the start of the grace-period clock checked
-    /// by [`Self::declare_default`].
+    /// by [`RepaymentWaterfall::declare_default`].
     pub fn mark_invoice_due(env: Env, invoice_id: Symbol, due_at: u64) {
         env.storage()
             .persistent()
             .set(&InvoiceDueKey(DUE_TAG, invoice_id), &due_at);
     }
 
+    /// When an invoice's repayment became due.
+    ///
+    /// # Arguments
+    /// * `invoice_id` — the invoice's symbol tag.
+    ///
+    /// # Returns
+    /// `Some(timestamp)` if the invoice has been marked due via
+    /// [`RepaymentWaterfall::mark_invoice_due`], or `None` if it has not —
+    /// in which case the grace-period clock has never started and the
+    /// invoice cannot be defaulted.
+    ///
+    /// Never panics.
     pub fn invoice_due_at(env: Env, invoice_id: Symbol) -> Option<u64> {
         env.storage()
             .persistent()
             .get(&InvoiceDueKey(DUE_TAG, invoice_id))
     }
 
+    /// Whether an invoice has been declared in default.
+    ///
+    /// # Arguments
+    /// * `invoice_id` — the invoice's symbol tag.
+    ///
+    /// # Returns
+    /// `true` once [`RepaymentWaterfall::declare_default`] has succeeded for
+    /// this invoice, `false` otherwise. An invoice that is merely overdue,
+    /// or still inside its grace period, reads `false`.
+    ///
+    /// Never panics.
     pub fn is_invoice_defaulted(env: Env, invoice_id: Symbol) -> bool {
         env.storage()
             .persistent()
@@ -443,7 +488,7 @@ impl RepaymentWaterfall {
     }
 
     /// Declares `invoice_id` in default once its grace period (due date +
-    /// [`Self::grace_period`]) has elapsed, applying `loss_amount` against
+    /// [`RepaymentWaterfall::grace_period`]) has elapsed, applying `loss_amount` against
     /// the pool's reserve — which reduces total capital and therefore NAV,
     /// proportionally reducing every LP's share value. Emits
     /// `InvoiceDefaulted`.
@@ -596,11 +641,13 @@ impl RepaymentWaterfall {
     }
 }
 
-// A queued, timelocked contract-Wasm upgrade.
+/// A queued, timelocked contract-Wasm upgrade.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QueuedUpgrade {
+    /// Hash of the Wasm this upgrade will install.
     pub new_wasm_hash: soroban_sdk::BytesN<32>,
+    /// Earliest ledger timestamp at which the swap may be executed.
     pub execute_after: u64,
 }
 
@@ -688,10 +735,25 @@ impl RepaymentWaterfall {
         Ok(())
     }
 
+    /// The upgrade currently waiting out its timelock, if any.
+    ///
+    /// # Returns
+    /// `Some(QueuedUpgrade)` carrying the pending Wasm hash and the earliest
+    /// timestamp it may execute at, or `None` when nothing is queued.
+    ///
+    /// Never panics.
     pub fn queued_upgrade(env: Env) -> Option<QueuedUpgrade> {
         env.storage().instance().get(&QUEUED_UPGRADE)
     }
 
+    /// Whether the final Wasm swap is currently held back.
+    ///
+    /// # Returns
+    /// `true` while upgrades are paused, `false` otherwise (the default).
+    /// Queueing and cancelling still work while paused — only execution is
+    /// blocked — so `true` here does not imply nothing is pending.
+    ///
+    /// Never panics.
     pub fn is_upgrade_paused(env: Env) -> bool {
         env.storage()
             .instance()
