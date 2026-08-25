@@ -24,6 +24,10 @@ ethnum = { path = "ethnum-1.5.0" }
 rust-version = "1.78"
 
 [dev-dependencies]
+# Property-based tests for the financial arithmetic (issue #9). Pinned minor
+# so a proptest release cannot change the generated cases and turn CI red on
+# a run that touched no contract code.
+proptest = "1.5"
 soroban-sdk = { workspace = true, features = ["testutils"] }
 invoice-registry = { path = "invoice-registry", features = ["testutils"] }
 pool-manager = { path = "pool-manager", features = ["testutils"] }
