@@ -34,9 +34,14 @@ fn deploys_all_three_contracts_in_the_same_env() {
     env.mock_all_auths();
     let (registry, pool, waterfall) = deploy_all(&env);
 
-    assert_eq!(registry.version(), 2);
-    assert_eq!(pool.version(), 1);
-    assert_eq!(waterfall.version(), 2);
+    // All three crates are currently at 0.1.0. Asserted as a literal rather
+    // than against this test crate's own CARGO_PKG_VERSION, which would only
+    // look coupled: the binding of each contract to its own manifest is what
+    // the per-crate unit tests check.
+    let expected = soroban_sdk::String::from_str(&env, "0.1.0");
+    assert_eq!(registry.version(), expected);
+    assert_eq!(pool.version(), expected);
+    assert_eq!(waterfall.version(), expected);
 }
 
 /// Happy-path cross-contract flow: an SME's invoice is acknowledged by the
