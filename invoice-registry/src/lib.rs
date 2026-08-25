@@ -26,6 +26,8 @@ mod storage {
     pub const ADMIN: Symbol = symbol_short!("admin");
     /// Marker field for `VerifierKey` — see that type's doc comment for why.
     pub const VERIFIER_TAG: Symbol = symbol_short!("verifier");
+    /// Marker field for `TermsKey` — same collision reasoning as `VerifierKey`.
+    pub const TERMS_TAG: Symbol = symbol_short!("terms");
 }
 
 /// Errors surfaced by the invoice registry. Stable `u32` discriminants so
@@ -58,6 +60,15 @@ pub enum ContractError {
     UpgradeTimelockNotElapsed = 11,
     /// `execute_upgrade` was called while upgrades are emergency-paused.
     UpgradesPaused = 12,
+    /// `create_invoice` was given a due date at or before the current ledger
+    /// timestamp.
+    InvalidDueDate = 13,
+    /// `create_invoice` was given a commitment of zero, which is the encoding
+    /// of "no invoice" and cannot identify a real amount.
+    InvalidCommitment = 14,
+    /// `create_invoice` was given a buyer equal to the SME's own tag, which
+    /// would let a seller finance an invoice against itself.
+    InvalidBuyer = 15,
 }
 
 /// Per-invoice storage key.
@@ -76,6 +87,17 @@ pub struct InvoiceKey(pub Symbol);
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifierKey(pub Symbol, pub Symbol);
+
+/// Per-invoice terms key (issue #13): `TermsKey(marker, id) -> InvoiceTerms`.
+///
+/// Carries the same fixed-marker treatment as [`VerifierKey`], and for the
+/// same reason: `#[contracttype]` encodes a tuple struct as a bare XDR vec of
+/// its fields with no type-name discriminant, so a single-`Symbol` key here
+/// would occupy the *same ledger slot* as `InvoiceKey` for the same id and
+/// silently overwrite the lifecycle record.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TermsKey(pub Symbol, pub Symbol);
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
@@ -115,6 +137,44 @@ pub struct CommittedInvoice {
     /// state-transition entrypoints (`approve`, `assign`, `mark_repaid`)
     /// return `ContractError::InvoiceFrozen`.
     pub frozen: bool,
+}
+
+// Stored alongside `CommittedInvoice` rather than merged into it: the
+// lifecycle record is rewritten on every status transition, while terms are
+// written once at creation and never mutated. Keeping them apart means a
+// transition cannot corrupt the terms, and invoices already registered
+// through `register` stay readable — merging would have changed the
+// on-ledger encoding of every record already stored.
+//
+// The amount is held as a Pedersen commitment, not plaintext. The issue asks
+// for the amount to be stored; this contract's stated invariant is that no
+// plaintext amount is ever written on-chain, so it is recorded the same way
+// every other amount here is. The SME computes `pedersen::commit(amount,
+// blinding)` off-chain and opens it on demand via `verify_amount`. Storing
+// plaintext would satisfy the issue's wording while breaking the property the
+// contract exists to provide.
+//
+// Doc comments on a `#[contracttype]` are embedded in the contract spec, which
+// caps them — hence the rationale above lives in plain comments and the doc
+// comment below stays short.
+
+/// Commercial terms of an invoice, recorded by [`InvoiceRegistry::create_invoice`].
+///
+/// Written once at creation and never mutated. The amount is a Pedersen
+/// commitment, openable via [`InvoiceRegistry::verify_amount`].
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvoiceTerms {
+    /// Buyer obligated to pay the invoice.
+    pub buyer: Symbol,
+    /// Pedersen commitment of the invoice amount.
+    pub commitment: i128,
+    /// Ledger timestamp by which the buyer must pay.
+    pub due_date: u64,
+    /// SME that raised the invoice, as an authenticated address.
+    pub sme: Address,
+    /// Ledger timestamp at which the invoice was created.
+    pub created_at: u64,
 }
 
 // ─── Contract ──────────────────────────────────────────────────────────────
@@ -167,6 +227,109 @@ impl InvoiceRegistry {
 
         env.storage().persistent().set(&key, &invoice);
         Ok(())
+    }
+
+    // Supersedes `register` as the entrypoint SMEs should use. `register`
+    // takes no buyer, no due date, and authenticates nobody — it records an
+    // owner tag on the caller's word.
+    //
+    // Two records are written under distinct keys: the `CommittedInvoice`
+    // lifecycle record, so every existing transition, freeze, and NFT
+    // entrypoint keeps working unchanged, and the `InvoiceTerms` record
+    // carrying buyer, commitment, due date, and SME address.
+    //
+    // The `owner` tag on the lifecycle record is `sme_tag` rather than the
+    // `Address`, because the rest of the registry keys ownership by `Symbol`.
+    // An invoice that could not be assigned or repaid afterwards would be
+    // worse than one whose owner is recorded in the established form. The
+    // authenticated `Address` is kept in the terms record, so both the signer
+    // and the lifecycle tag stay recoverable.
+    //
+    // Doc comments here are embedded in the contract spec, which caps their
+    // length — so the rationale lives in plain comments and the doc comment
+    // stays to what callers actually need.
+
+    /// Create an invoice with its full commercial schema.
+    ///
+    /// Requires the SME's signature, validates the terms, and records them.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContractError::InvoiceAlreadyExists`] — id already registered,
+    ///   checked against both the lifecycle and terms records.
+    /// - [`ContractError::InvalidDueDate`] — due date is not in the future.
+    /// - [`ContractError::InvalidCommitment`] — commitment is zero.
+    /// - [`ContractError::InvalidBuyer`] — buyer and SME tag are the same.
+    pub fn create_invoice(
+        env: Env,
+        sme: Address,
+        sme_tag: Symbol,
+        id: Symbol,
+        buyer: Symbol,
+        commitment: i128,
+        due_date: u64,
+    ) -> Result<(), ContractError> {
+        // Authenticate before touching storage or validating: an unsigned
+        // call should not be able to probe which invoice ids exist by
+        // distinguishing error codes.
+        sme.require_auth();
+
+        let key = InvoiceKey(id.clone());
+        let terms_key = TermsKey(storage::TERMS_TAG, id.clone());
+        if env.storage().persistent().has(&key) || env.storage().persistent().has(&terms_key) {
+            return Err(ContractError::InvoiceAlreadyExists);
+        }
+
+        if commitment == 0 {
+            return Err(ContractError::InvalidCommitment);
+        }
+        // A due date in the past makes the invoice defaulted the moment it
+        // exists, which the repayment waterfall has no sensible handling for.
+        let now = env.ledger().timestamp();
+        if due_date <= now {
+            return Err(ContractError::InvalidDueDate);
+        }
+        if buyer == sme_tag {
+            return Err(ContractError::InvalidBuyer);
+        }
+
+        let invoice = CommittedInvoice {
+            id: id.clone(),
+            commitment,
+            status: InvoiceStatus::Pending,
+            owner: sme_tag,
+            fraud_flagged: false,
+            frozen: false,
+        };
+        let terms = InvoiceTerms {
+            buyer: buyer.clone(),
+            commitment,
+            due_date,
+            sme: sme.clone(),
+            created_at: now,
+        };
+
+        env.storage().persistent().set(&key, &invoice);
+        env.storage().persistent().set(&terms_key, &terms);
+
+        // Topic carries the id so indexers can filter per invoice without
+        // decoding every payload; the payload carries the fields an indexer
+        // needs to build a row without a follow-up read.
+        env.events().publish(
+            (symbol_short!("inv_new"), id),
+            (sme, buyer, commitment, due_date),
+        );
+        Ok(())
+    }
+
+    /// Commercial terms recorded by [`Self::create_invoice`], if any.
+    ///
+    /// Returns `None` for invoices created through the legacy
+    /// [`Self::register`] path, which records no terms.
+    pub fn invoice_terms(env: Env, id: Symbol) -> Option<InvoiceTerms> {
+        env.storage()
+            .persistent()
+            .get(&TermsKey(storage::TERMS_TAG, id))
     }
 
     /// Admin approves a pending invoice (Pending → Approved).
