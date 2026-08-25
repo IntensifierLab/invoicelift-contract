@@ -277,7 +277,7 @@ impl PoolManager {
         if sme_limit_bps <= 0 || sme_limit_bps > BPS_SCALE {
             return Err(ContractError::InvalidBps);
         }
-        if reserve_ratio_bps < 0 || reserve_ratio_bps > BPS_SCALE {
+        if !(0..=BPS_SCALE).contains(&reserve_ratio_bps) {
             return Err(ContractError::InvalidBps);
         }
         if min_deposit <= 0 || min_deposit > max_deposit {
@@ -303,7 +303,13 @@ impl PoolManager {
 
         env.events().publish(
             (symbol_short!("pool_new"),),
-            (buyer_limit_bps, sme_limit_bps, min_deposit, max_deposit, reserve_ratio_bps),
+            (
+                buyer_limit_bps,
+                sme_limit_bps,
+                min_deposit,
+                max_deposit,
+                reserve_ratio_bps,
+            ),
         );
         Ok(())
     }
@@ -497,8 +503,14 @@ impl PoolManager {
             &env.ledger().timestamp(),
         );
 
-        env.events()
-            .publish((symbol_short!("shr_mint"), lender), shares);
+        // `shares` alone cannot be reconciled by an indexer: shares are
+        // minted at the prevailing NAV, so without the amount and the NAV
+        // used there is no way to check the mint was priced correctly, or to
+        // rebuild a lender's cost basis from the event stream.
+        env.events().publish(
+            (symbol_short!("shr_mint"), lender),
+            (amount, shares, nav, new_tot_shares),
+        );
 
         Ok(shares)
     }
@@ -514,7 +526,11 @@ impl PoolManager {
             return Err(ContractError::InvalidShares);
         }
 
-        let lock_secs: u64 = env.storage().instance().get(&storage::LOCK_SECS).unwrap_or(0);
+        let lock_secs: u64 = env
+            .storage()
+            .instance()
+            .get(&storage::LOCK_SECS)
+            .unwrap_or(0);
         if lock_secs > 0 {
             if let Some(deposited_at) = env
                 .storage()
@@ -626,7 +642,10 @@ impl PoolManager {
     ///
     /// Never panics.
     pub fn lock_period(env: Env) -> u64 {
-        env.storage().instance().get(&storage::LOCK_SECS).unwrap_or(0)
+        env.storage()
+            .instance()
+            .get(&storage::LOCK_SECS)
+            .unwrap_or(0)
     }
 
     /// Configures the pool-utilisation bps threshold above which withdrawals
@@ -1323,9 +1342,12 @@ impl PoolManager {
         }
     }
 
-    /// Contract ABI / deployment marker for integrators.
-    pub fn version(_env: Env) -> u32 {
-        1
+    /// Semantic version of this contract, read from `Cargo.toml` at compile
+    /// time via `CARGO_PKG_VERSION` so the published version and the on-chain
+    /// one cannot drift. Returns `soroban_sdk::String` fully qualified rather
+    /// than importing it, to leave this crate's `use` block untouched.
+    pub fn version(env: Env) -> soroban_sdk::String {
+        soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION"))
     }
 
     // ── upgrade (proxy upgradability pattern) ───────────────────────────
@@ -1352,7 +1374,10 @@ impl PoolManager {
     /// from now (`TIMELOCK_SECS`, same delay as parameter changes). Requires
     /// the timelock admin's authorization. Returns the ledger timestamp
     /// after which it becomes executable.
-    pub fn queue_upgrade(env: Env, new_wasm_hash: soroban_sdk::BytesN<32>) -> Result<u64, ContractError> {
+    pub fn queue_upgrade(
+        env: Env,
+        new_wasm_hash: soroban_sdk::BytesN<32>,
+    ) -> Result<u64, ContractError> {
         Self::require_timelock_admin(&env)?;
 
         let execute_after = env.ledger().timestamp() + TIMELOCK_SECS;
@@ -1412,7 +1437,9 @@ impl PoolManager {
     /// is held back). Requires the timelock admin's authorization.
     pub fn set_upgrade_paused(env: Env, paused: bool) -> Result<(), ContractError> {
         Self::require_timelock_admin(&env)?;
-        env.storage().instance().set(&storage::UPGRADE_PAUSED, &paused);
+        env.storage()
+            .instance()
+            .set(&storage::UPGRADE_PAUSED, &paused);
         Ok(())
     }
 
@@ -1574,8 +1601,7 @@ mod tests {
         env.as_contract(&registry_addr, || {
             InvoiceRegistry::register(env.clone(), inv_id.clone(), 111, symbol_short!("sme1"))
                 .unwrap();
-            InvoiceRegistry::approve(env.clone(), symbol_short!("admin"), inv_id.clone())
-                .unwrap();
+            InvoiceRegistry::approve(env.clone(), symbol_short!("admin"), inv_id.clone()).unwrap();
         });
 
         env.as_contract(&pool_addr, || {
@@ -1653,6 +1679,16 @@ mod tests {
     }
 
     // ── join_pool ──────────────────────────────────────────────────────
+
+    #[test]
+    fn version_matches_the_crate_manifest() {
+        let (env, contract_id) = setup();
+        let v = env.as_contract(&contract_id, || PoolManager::version(env.clone()));
+        assert_eq!(
+            v,
+            soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION"))
+        );
+    }
 
     #[test]
     fn join_pool_first_deposit_prices_shares_one_to_one() {
@@ -2344,7 +2380,9 @@ mod tests {
     fn queue_upgrade_requires_timelock_admin() {
         let (env, contract_addr) = setup();
         let hash = dummy_wasm_hash(&env);
-        let err = env.as_contract(&contract_addr, || PoolManager::queue_upgrade(env.clone(), hash));
+        let err = env.as_contract(&contract_addr, || {
+            PoolManager::queue_upgrade(env.clone(), hash)
+        });
         assert_eq!(err, Err(ContractError::TimelockAdminNotSet));
     }
 

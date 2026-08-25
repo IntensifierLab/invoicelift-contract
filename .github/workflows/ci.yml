@@ -6,6 +6,26 @@ on:
   pull_request:
 
 jobs:
+  lint:
+    name: Formatting and Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      # A separate job from `contracts` on purpose: a formatting deviation and
+      # a failing test are different kinds of problem, and folding them
+      # together would hide one behind the other in the checks list.
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      # --all-targets so tests and benches are linted too — most of the
+      # warnings this repo had were in test code, which a bare `cargo clippy`
+      # would not have seen.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
   contracts:
     runs-on: ubuntu-latest
     steps:

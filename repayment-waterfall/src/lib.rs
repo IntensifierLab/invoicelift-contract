@@ -314,6 +314,14 @@ impl RepaymentWaterfall {
             .ok_or(ContractError::PoolManagerNotConfigured)?;
 
         PoolManagerClient::new(&env, &pool_manager).apply_reserve_delta(&amount);
+
+        // Emitted after the cross-contract call, not before: if
+        // `apply_reserve_delta` traps, the whole invocation reverts and no
+        // event should have been claimed for a transfer that did not happen.
+        env.events().publish(
+            (symbol_short!("repaid"),),
+            (amount, env.ledger().timestamp()),
+        );
         Ok(())
     }
 
@@ -405,9 +413,12 @@ impl RepaymentWaterfall {
         marker
     }
 
-    /// Contract ABI / deployment marker for integrators.
-    pub fn version(_env: Env) -> u32 {
-        2
+    /// Semantic version of this contract, read from `Cargo.toml` at compile
+    /// time via `CARGO_PKG_VERSION` so the published version and the on-chain
+    /// one cannot drift. Returns `soroban_sdk::String` fully qualified rather
+    /// than importing it, to leave this crate's `use` block untouched.
+    pub fn version(env: Env) -> soroban_sdk::String {
+        soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION"))
     }
 
     // ── Delinquency handling (issue #21) ─────────────────────────────────
@@ -681,7 +692,11 @@ impl RepaymentWaterfall {
     /// by anyone - the outcome is fully determined by the queued state and
     /// current ledger time.
     pub fn execute_upgrade(env: Env) -> Result<(), ContractError> {
-        let paused: bool = env.storage().instance().get(&UPGRADE_PAUSED).unwrap_or(false);
+        let paused: bool = env
+            .storage()
+            .instance()
+            .get(&UPGRADE_PAUSED)
+            .unwrap_or(false);
         if paused {
             return Err(ContractError::UpgradesPaused);
         }
@@ -696,7 +711,8 @@ impl RepaymentWaterfall {
         }
 
         env.storage().instance().remove(&QUEUED_UPGRADE);
-        env.deployer().update_current_contract_wasm(queued.new_wasm_hash);
+        env.deployer()
+            .update_current_contract_wasm(queued.new_wasm_hash);
         Ok(())
     }
 
@@ -739,7 +755,10 @@ impl RepaymentWaterfall {
     ///
     /// Never panics.
     pub fn is_upgrade_paused(env: Env) -> bool {
-        env.storage().instance().get(&UPGRADE_PAUSED).unwrap_or(false)
+        env.storage()
+            .instance()
+            .get(&UPGRADE_PAUSED)
+            .unwrap_or(false)
     }
 
     fn require_upgrade_admin(env: &Env, caller: &Symbol) -> Result<(), ContractError> {
@@ -804,6 +823,16 @@ mod tests {
     }
 
     // ── Priority repayment waterfall ────────────────────────────────────
+
+    #[test]
+    fn version_matches_the_crate_manifest() {
+        let (env, contract_id, _pool) = setup();
+        let v = env.as_contract(&contract_id, || RepaymentWaterfall::version(env.clone()));
+        assert_eq!(
+            v,
+            soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION"))
+        );
+    }
 
     #[test]
     fn waterfall_full_repayment_covers_every_bucket() {
@@ -951,7 +980,10 @@ mod tests {
         env.as_contract(&waterfall_addr, || {
             RepaymentWaterfall::record_default(env.clone(), 1_000);
             RepaymentWaterfall::record_default(env.clone(), 2_000);
-            assert_eq!(RepaymentWaterfall::current_default_volume(env.clone()), 3_000);
+            assert_eq!(
+                RepaymentWaterfall::current_default_volume(env.clone()),
+                3_000
+            );
             assert!(!RepaymentWaterfall::circuit_breaker_active(env.clone()));
         });
     }
@@ -1090,8 +1122,9 @@ mod tests {
     #[test]
     fn execute_upgrade_with_nothing_queued_errors() {
         let (env, waterfall_addr, _pool_addr) = setup();
-        let err =
-            env.as_contract(&waterfall_addr, || RepaymentWaterfall::execute_upgrade(env.clone()));
+        let err = env.as_contract(&waterfall_addr, || {
+            RepaymentWaterfall::execute_upgrade(env.clone())
+        });
         assert_eq!(err, Err(ContractError::NoQueuedUpgrade));
     }
 
@@ -1120,8 +1153,9 @@ mod tests {
 
         env.ledger().with_mut(|li| li.timestamp += 48 * 60 * 60);
 
-        let err =
-            env.as_contract(&waterfall_addr, || RepaymentWaterfall::execute_upgrade(env.clone()));
+        let err = env.as_contract(&waterfall_addr, || {
+            RepaymentWaterfall::execute_upgrade(env.clone())
+        });
         assert_eq!(err, Err(ContractError::UpgradesPaused));
     }
 }

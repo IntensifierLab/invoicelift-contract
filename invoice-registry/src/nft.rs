@@ -61,7 +61,10 @@ pub struct TransferRecord {
 /// Panics if this token has already been minted.
 pub fn mint(env: &Env, token_id: Symbol, owner: Symbol) {
     let key = owner_key(&token_id);
-    assert!(!env.storage().persistent().has(&key), "token already minted");
+    assert!(
+        !env.storage().persistent().has(&key),
+        "token already minted"
+    );
     env.storage().persistent().set(&key, &owner);
     env.storage()
         .persistent()

@@ -65,7 +65,7 @@ pub struct VerificationState {
 pub fn configure(env: &Env, invoice_id: Symbol, required: u32, signers: Vec<BytesN<32>>) {
     assert!(required > 0, "required must be positive");
     assert!(
-        (required as u32) <= signers.len(),
+        required <= signers.len(),
         "required cannot exceed the number of signers"
     );
 
@@ -79,7 +79,9 @@ pub fn configure(env: &Env, invoice_id: Symbol, required: u32, signers: Vec<Byte
         deadline: env.ledger().timestamp() + DEFAULT_TIMEOUT_SECS,
         verified: false,
     };
-    env.storage().persistent().set(&state_key(&invoice_id), &state);
+    env.storage()
+        .persistent()
+        .set(&state_key(&invoice_id), &state);
 }
 
 /// Submit one signature over `message` from `signer_pubkey` toward
@@ -132,7 +134,9 @@ pub fn submit_signature(
     }
 
     let reached = state.verified;
-    env.storage().persistent().set(&state_key(&invoice_id), &state);
+    env.storage()
+        .persistent()
+        .set(&state_key(&invoice_id), &state);
     reached
 }
 
@@ -227,8 +231,13 @@ mod tests {
         let f = setup(2);
         f.env.as_contract(&f.addr, || {
             let (msg, sig) = sign(&f.env, &f.signers[0].1, b"invoice INV1 amount 50000");
-            let reached =
-                submit_signature(&f.env, f.invoice_id.clone(), f.signers[0].0.clone(), msg, sig);
+            let reached = submit_signature(
+                &f.env,
+                f.invoice_id.clone(),
+                f.signers[0].0.clone(),
+                msg,
+                sig,
+            );
             assert!(!reached);
             let state = status(&f.env, f.invoice_id.clone());
             assert_eq!(state.collected.len(), 1);
@@ -254,10 +263,22 @@ mod tests {
         let f = setup(2);
         f.env.as_contract(&f.addr, || {
             let (msg1, sig1) = sign(&f.env, &f.signers[0].1, b"invoice INV1 amount 50000");
-            submit_signature(&f.env, f.invoice_id.clone(), f.signers[0].0.clone(), msg1, sig1);
+            submit_signature(
+                &f.env,
+                f.invoice_id.clone(),
+                f.signers[0].0.clone(),
+                msg1,
+                sig1,
+            );
 
             let (msg2, sig2) = sign(&f.env, &f.signers[0].1, b"invoice INV1 amount 50000");
-            submit_signature(&f.env, f.invoice_id.clone(), f.signers[0].0.clone(), msg2, sig2);
+            submit_signature(
+                &f.env,
+                f.invoice_id.clone(),
+                f.signers[0].0.clone(),
+                msg2,
+                sig2,
+            );
         });
     }
 
@@ -266,13 +287,23 @@ mod tests {
         let f = setup(2);
         f.env.as_contract(&f.addr, || {
             let (msg0, sig0) = sign(&f.env, &f.signers[0].1, b"invoice INV1 amount 50000");
-            let reached0 =
-                submit_signature(&f.env, f.invoice_id.clone(), f.signers[0].0.clone(), msg0, sig0);
+            let reached0 = submit_signature(
+                &f.env,
+                f.invoice_id.clone(),
+                f.signers[0].0.clone(),
+                msg0,
+                sig0,
+            );
             assert!(!reached0);
 
             let (msg1, sig1) = sign(&f.env, &f.signers[1].1, b"invoice INV1 amount 50000");
-            let reached1 =
-                submit_signature(&f.env, f.invoice_id.clone(), f.signers[1].0.clone(), msg1, sig1);
+            let reached1 = submit_signature(
+                &f.env,
+                f.invoice_id.clone(),
+                f.signers[1].0.clone(),
+                msg1,
+                sig1,
+            );
             assert!(reached1);
 
             let state = status(&f.env, f.invoice_id.clone());
@@ -286,7 +317,13 @@ mod tests {
         let f = setup(2);
         f.env.as_contract(&f.addr, || {
             let (msg, sig) = sign(&f.env, &f.signers[0].1, b"invoice INV1 amount 50000");
-            submit_signature(&f.env, f.invoice_id.clone(), f.signers[0].0.clone(), msg, sig);
+            submit_signature(
+                &f.env,
+                f.invoice_id.clone(),
+                f.signers[0].0.clone(),
+                msg,
+                sig,
+            );
 
             assert!(!is_expired(&f.env, f.invoice_id.clone()));
             let state = status(&f.env, f.invoice_id.clone());
@@ -298,11 +335,19 @@ mod tests {
     #[should_panic(expected = "verification window has expired")]
     fn submitting_after_deadline_is_rejected_even_with_a_valid_signature() {
         let f = setup(2);
-        f.env.ledger().with_mut(|li| li.timestamp += DEFAULT_TIMEOUT_SECS + 1);
+        f.env
+            .ledger()
+            .with_mut(|li| li.timestamp += DEFAULT_TIMEOUT_SECS + 1);
         f.env.as_contract(&f.addr, || {
             assert!(is_expired(&f.env, f.invoice_id.clone()));
             let (msg, sig) = sign(&f.env, &f.signers[0].1, b"invoice INV1 amount 50000");
-            submit_signature(&f.env, f.invoice_id.clone(), f.signers[0].0.clone(), msg, sig);
+            submit_signature(
+                &f.env,
+                f.invoice_id.clone(),
+                f.signers[0].0.clone(),
+                msg,
+                sig,
+            );
         });
     }
 
@@ -337,7 +382,13 @@ mod tests {
             let mut raw = sig_bytes.to_array();
             raw[0] ^= 0xFF;
             let tampered_sig = BytesN::from_array(&f.env, &raw);
-            submit_signature(&f.env, f.invoice_id.clone(), f.signers[0].0.clone(), msg, tampered_sig);
+            submit_signature(
+                &f.env,
+                f.invoice_id.clone(),
+                f.signers[0].0.clone(),
+                msg,
+                tampered_sig,
+            );
         });
     }
 
@@ -350,7 +401,12 @@ mod tests {
         let (pk, _) = keypair();
         let pk = BytesN::from_array(&env, &pk);
         env.as_contract(&addr, || {
-            configure(&env, Symbol::new(&env, "INVX"), 5, Vec::from_array(&env, [pk]));
+            configure(
+                &env,
+                Symbol::new(&env, "INVX"),
+                5,
+                Vec::from_array(&env, [pk]),
+            );
         });
     }
 }
