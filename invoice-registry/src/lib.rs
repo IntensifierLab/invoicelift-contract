@@ -17,19 +17,7 @@ use soroban_sdk::{
 
 pub use multisig::{VerificationConfig, VerificationState};
 pub use nft::TransferRecord;
-
-// ─── Storage Keys ──────────────────────────────────────────────────────────
-
-mod storage {
-    use soroban_sdk::{symbol_short, Symbol};
-
-    /// Instance-storage tag holding the registry admin.
-    pub const ADMIN: Symbol = symbol_short!("admin");
-    /// Marker field for `VerifierKey` — see that type's doc comment for why.
-    pub const VERIFIER_TAG: Symbol = symbol_short!("verifier");
-    /// Marker field for `TermsKey` — same collision reasoning as `VerifierKey`.
-    pub const TERMS_TAG: Symbol = symbol_short!("terms");
-}
+mod keys;
 
 /// Errors surfaced by the invoice registry. Stable `u32` discriminants so
 /// integrators and audit tooling can match on them.
@@ -192,10 +180,10 @@ impl InvoiceRegistry {
     /// already been initialized, so the admin can never be silently
     /// overwritten.
     pub fn initialize(env: Env, admin: Symbol) -> Result<(), ContractError> {
-        if env.storage().instance().has(&storage::ADMIN) {
+        if env.storage().instance().has(&keys::ADMIN) {
             return Err(ContractError::AlreadyInitialized);
         }
-        env.storage().instance().set(&storage::ADMIN, &admin);
+        env.storage().instance().set(&keys::ADMIN, &admin);
         Ok(())
     }
 
@@ -276,7 +264,7 @@ impl InvoiceRegistry {
         sme.require_auth();
 
         let key = InvoiceKey(id.clone());
-        let terms_key = TermsKey(storage::TERMS_TAG, id.clone());
+        let terms_key = TermsKey(keys::TERMS_TAG, id.clone());
         if env.storage().persistent().has(&key) || env.storage().persistent().has(&terms_key) {
             return Err(ContractError::InvoiceAlreadyExists);
         }
@@ -330,7 +318,7 @@ impl InvoiceRegistry {
     pub fn invoice_terms(env: Env, id: Symbol) -> Option<InvoiceTerms> {
         env.storage()
             .persistent()
-            .get(&TermsKey(storage::TERMS_TAG, id))
+            .get(&TermsKey(keys::TERMS_TAG, id))
     }
 
     /// Admin approves a pending invoice (Pending → Approved).
@@ -369,7 +357,7 @@ impl InvoiceRegistry {
         Self::require_admin(&env, &caller)?;
         env.storage()
             .persistent()
-            .set(&VerifierKey(storage::VERIFIER_TAG, verifier), &is_verifier);
+            .set(&VerifierKey(keys::VERIFIER_TAG, verifier), &is_verifier);
         Ok(())
     }
 
@@ -377,7 +365,7 @@ impl InvoiceRegistry {
     pub fn is_verifier(env: Env, verifier: Symbol) -> bool {
         env.storage()
             .persistent()
-            .get(&VerifierKey(storage::VERIFIER_TAG, verifier))
+            .get(&VerifierKey(keys::VERIFIER_TAG, verifier))
             .unwrap_or(false)
     }
 
@@ -674,7 +662,7 @@ impl InvoiceRegistry {
         let admin: Symbol = env
             .storage()
             .instance()
-            .get(&storage::ADMIN)
+            .get(&keys::ADMIN)
             .ok_or(ContractError::NotInitialized)?;
         if *caller != admin {
             return Err(ContractError::Unauthorized);
@@ -750,8 +738,6 @@ pub struct QueuedUpgrade {
 }
 
 const UPGRADE_TIMELOCK_SECS: u64 = 48 * 60 * 60;
-const QUEUED_UPGRADE: Symbol = symbol_short!("q_upgrd");
-const UPGRADE_PAUSED: Symbol = symbol_short!("up_pause");
 
 // ── upgrade (proxy upgradability pattern) ───────────────────────────────
 //
@@ -773,7 +759,7 @@ impl InvoiceRegistry {
 
         let execute_after = env.ledger().timestamp() + UPGRADE_TIMELOCK_SECS;
         env.storage().instance().set(
-            &QUEUED_UPGRADE,
+            &keys::QUEUED_UPGRADE,
             &QueuedUpgrade {
                 new_wasm_hash,
                 execute_after,
@@ -788,7 +774,7 @@ impl InvoiceRegistry {
         let paused: bool = env
             .storage()
             .instance()
-            .get(&UPGRADE_PAUSED)
+            .get(&keys::UPGRADE_PAUSED)
             .unwrap_or(false);
         if paused {
             return Err(ContractError::UpgradesPaused);
@@ -797,13 +783,13 @@ impl InvoiceRegistry {
         let queued: QueuedUpgrade = env
             .storage()
             .instance()
-            .get(&QUEUED_UPGRADE)
+            .get(&keys::QUEUED_UPGRADE)
             .ok_or(ContractError::NoQueuedUpgrade)?;
         if env.ledger().timestamp() < queued.execute_after {
             return Err(ContractError::UpgradeTimelockNotElapsed);
         }
 
-        env.storage().instance().remove(&QUEUED_UPGRADE);
+        env.storage().instance().remove(&keys::QUEUED_UPGRADE);
         env.deployer()
             .update_current_contract_wasm(queued.new_wasm_hash);
         Ok(())
@@ -813,10 +799,10 @@ impl InvoiceRegistry {
     /// admin.
     pub fn cancel_upgrade(env: Env, caller: Symbol) -> Result<(), ContractError> {
         Self::require_admin(&env, &caller)?;
-        if !env.storage().instance().has(&QUEUED_UPGRADE) {
+        if !env.storage().instance().has(&keys::QUEUED_UPGRADE) {
             return Err(ContractError::NoQueuedUpgrade);
         }
-        env.storage().instance().remove(&QUEUED_UPGRADE);
+        env.storage().instance().remove(&keys::QUEUED_UPGRADE);
         Ok(())
     }
 
@@ -824,7 +810,7 @@ impl InvoiceRegistry {
     /// the stored admin.
     pub fn set_upgrade_paused(env: Env, caller: Symbol, paused: bool) -> Result<(), ContractError> {
         Self::require_admin(&env, &caller)?;
-        env.storage().instance().set(&UPGRADE_PAUSED, &paused);
+        env.storage().instance().set(&keys::UPGRADE_PAUSED, &paused);
         Ok(())
     }
 
@@ -836,7 +822,7 @@ impl InvoiceRegistry {
     ///
     /// Never panics — callers poll this to decide whether an upgrade is due.
     pub fn queued_upgrade(env: Env) -> Option<QueuedUpgrade> {
-        env.storage().instance().get(&QUEUED_UPGRADE)
+        env.storage().instance().get(&keys::QUEUED_UPGRADE)
     }
 
     /// Whether the final Wasm swap is currently held back.
@@ -850,7 +836,7 @@ impl InvoiceRegistry {
     pub fn is_upgrade_paused(env: Env) -> bool {
         env.storage()
             .instance()
-            .get(&UPGRADE_PAUSED)
+            .get(&keys::UPGRADE_PAUSED)
             .unwrap_or(false)
     }
 }

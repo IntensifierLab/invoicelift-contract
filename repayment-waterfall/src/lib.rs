@@ -3,6 +3,8 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Env, Symbol, Vec,
 };
 
+mod keys;
+
 /// Pedersen constants matching those in the invoice registry.
 const P: i128 = i128::MAX;
 
@@ -178,18 +180,7 @@ pub struct DefaultRecord {
 
 use soroban_sdk::{contractclient, Address};
 
-const POOL_MANAGER: Symbol = symbol_short!("pool_mgr");
-
 // ── Delinquency handling (issue #21) ────────────────────────────────────
-
-/// Grace period (seconds) applied before an overdue invoice can be
-/// declared in default. Defaults to 0 (no grace) if never configured via
-/// `set_grace_period`.
-const GRACE_SECS: Symbol = symbol_short!("grace");
-/// Marker fields for `InvoiceDueKey`/`InvoiceDefaultedKey` — see those
-/// types' doc comments for why a marker is required.
-const DUE_TAG: Symbol = symbol_short!("due_tag");
-const DEFAULT_TAG: Symbol = symbol_short!("dflt_tag");
 
 /// Per-invoice due-date storage key (issue #21): when the invoice's
 /// repayment became due, i.e. the start of the grace-period clock.
@@ -209,13 +200,6 @@ pub struct InvoiceDueKey(pub Symbol, pub Symbol);
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InvoiceDefaultedKey(pub Symbol, pub Symbol);
-
-/// Storage key for the current rolling-window `DefaultRecord`.
-const DEFAULT_RECORD: Symbol = symbol_short!("dflt_rec");
-/// Storage key for the configured circuit-breaker default-volume threshold.
-const CB_THRESHOLD: Symbol = symbol_short!("cb_thresh");
-/// Storage key for the circuit-breaker tripped flag.
-const CB_ACTIVE: Symbol = symbol_short!("cb_active");
 
 /// Length of the rolling default-volume window, in seconds (24h), mirroring
 /// the `env.ledger().timestamp()` idiom used for pool-manager's timelock.
@@ -242,13 +226,13 @@ impl RepaymentWaterfall {
     /// `pool_manager` is the deployed PoolManager contract this waterfall
     /// forwards repayments to.
     pub fn initialize(env: Env, admin: Symbol, pool_manager: Address) -> Result<(), ContractError> {
-        if env.storage().instance().has(&symbol_short!("admin")) {
+        if env.storage().instance().has(&keys::ADMIN) {
             return Err(ContractError::AlreadyInitialized);
         }
+        env.storage().instance().set(&keys::ADMIN, &admin);
         env.storage()
             .instance()
-            .set(&symbol_short!("admin"), &admin);
-        env.storage().instance().set(&POOL_MANAGER, &pool_manager);
+            .set(&keys::POOL_MANAGER, &pool_manager);
         Ok(())
     }
 
@@ -310,7 +294,7 @@ impl RepaymentWaterfall {
         let pool_manager: Address = env
             .storage()
             .instance()
-            .get(&POOL_MANAGER)
+            .get(&keys::POOL_MANAGER)
             .ok_or(ContractError::PoolManagerNotConfigured)?;
 
         PoolManagerClient::new(&env, &pool_manager).apply_reserve_delta(&amount);
@@ -379,7 +363,7 @@ impl RepaymentWaterfall {
         let pool_manager: Address = env
             .storage()
             .instance()
-            .get(&POOL_MANAGER)
+            .get(&keys::POOL_MANAGER)
             .ok_or(ContractError::PoolManagerNotConfigured)?;
 
         let to_pool = principal_paid + reserve_paid + lender_yield_paid;
@@ -426,7 +410,7 @@ impl RepaymentWaterfall {
     /// Configures the grace period (seconds) applied before an overdue
     /// invoice can be declared in default.
     pub fn set_grace_period(env: Env, secs: u64) {
-        env.storage().instance().set(&GRACE_SECS, &secs);
+        env.storage().instance().set(&keys::GRACE_SECS, &secs);
     }
 
     /// Grace period applied before an overdue invoice can be defaulted.
@@ -439,7 +423,7 @@ impl RepaymentWaterfall {
     ///
     /// Never panics.
     pub fn grace_period(env: Env) -> u64 {
-        env.storage().instance().get(&GRACE_SECS).unwrap_or(0)
+        env.storage().instance().get(&keys::GRACE_SECS).unwrap_or(0)
     }
 
     /// Registers `due_at` (ledger timestamp) as the moment `invoice_id`'s
@@ -448,7 +432,7 @@ impl RepaymentWaterfall {
     pub fn mark_invoice_due(env: Env, invoice_id: Symbol, due_at: u64) {
         env.storage()
             .persistent()
-            .set(&InvoiceDueKey(DUE_TAG, invoice_id), &due_at);
+            .set(&InvoiceDueKey(keys::DUE_TAG, invoice_id), &due_at);
     }
 
     /// When an invoice's repayment became due.
@@ -466,7 +450,7 @@ impl RepaymentWaterfall {
     pub fn invoice_due_at(env: Env, invoice_id: Symbol) -> Option<u64> {
         env.storage()
             .persistent()
-            .get(&InvoiceDueKey(DUE_TAG, invoice_id))
+            .get(&InvoiceDueKey(keys::DUE_TAG, invoice_id))
     }
 
     /// Whether an invoice has been declared in default.
@@ -483,7 +467,7 @@ impl RepaymentWaterfall {
     pub fn is_invoice_defaulted(env: Env, invoice_id: Symbol) -> bool {
         env.storage()
             .persistent()
-            .get(&InvoiceDefaultedKey(DEFAULT_TAG, invoice_id))
+            .get(&InvoiceDefaultedKey(keys::DEFAULT_TAG, invoice_id))
             .unwrap_or(false)
     }
 
@@ -504,14 +488,14 @@ impl RepaymentWaterfall {
             return Err(ContractError::InvalidLossAmount);
         }
 
-        let due_key = InvoiceDueKey(DUE_TAG, invoice_id.clone());
+        let due_key = InvoiceDueKey(keys::DUE_TAG, invoice_id.clone());
         let due_at: u64 = env
             .storage()
             .persistent()
             .get(&due_key)
             .ok_or(ContractError::InvoiceDueDateNotSet)?;
 
-        let defaulted_key = InvoiceDefaultedKey(DEFAULT_TAG, invoice_id.clone());
+        let defaulted_key = InvoiceDefaultedKey(keys::DEFAULT_TAG, invoice_id.clone());
         if env
             .storage()
             .persistent()
@@ -521,7 +505,7 @@ impl RepaymentWaterfall {
             return Err(ContractError::InvoiceAlreadyDefaulted);
         }
 
-        let grace_secs: u64 = env.storage().instance().get(&GRACE_SECS).unwrap_or(0);
+        let grace_secs: u64 = env.storage().instance().get(&keys::GRACE_SECS).unwrap_or(0);
         if env.ledger().timestamp() < due_at + grace_secs {
             return Err(ContractError::GracePeriodNotElapsed);
         }
@@ -531,7 +515,7 @@ impl RepaymentWaterfall {
         let pool_manager: Address = env
             .storage()
             .instance()
-            .get(&POOL_MANAGER)
+            .get(&keys::POOL_MANAGER)
             .ok_or(ContractError::PoolManagerNotConfigured)?;
         PoolManagerClient::new(&env, &pool_manager).apply_reserve_delta(&(-loss_amount));
 
@@ -558,14 +542,14 @@ impl RepaymentWaterfall {
         assert!(amount > 0, "amount must be positive");
 
         let now = env.ledger().timestamp();
-        let mut record: DefaultRecord =
-            env.storage()
-                .instance()
-                .get(&DEFAULT_RECORD)
-                .unwrap_or(DefaultRecord {
-                    window_start: now,
-                    volume: 0,
-                });
+        let mut record: DefaultRecord = env
+            .storage()
+            .instance()
+            .get(&keys::DEFAULT_RECORD)
+            .unwrap_or(DefaultRecord {
+                window_start: now,
+                volume: 0,
+            });
 
         if now.saturating_sub(record.window_start) >= CIRCUIT_BREAKER_WINDOW_SECS {
             record.window_start = now;
@@ -574,12 +558,16 @@ impl RepaymentWaterfall {
             record.volume += amount;
         }
 
-        env.storage().instance().set(&DEFAULT_RECORD, &record);
+        env.storage().instance().set(&keys::DEFAULT_RECORD, &record);
 
-        let threshold: i128 = env.storage().instance().get(&CB_THRESHOLD).unwrap_or(0);
+        let threshold: i128 = env
+            .storage()
+            .instance()
+            .get(&keys::CB_THRESHOLD)
+            .unwrap_or(0);
 
         if threshold > 0 && record.volume >= threshold {
-            env.storage().instance().set(&CB_ACTIVE, &true);
+            env.storage().instance().set(&keys::CB_ACTIVE, &true);
             env.events()
                 .publish((symbol_short!("cb_trip"),), (record.volume, threshold));
         }
@@ -590,7 +578,9 @@ impl RepaymentWaterfall {
     pub fn set_circuit_breaker_threshold(env: Env, admin: Symbol, threshold: i128) {
         Self::require_admin(&env, &admin);
         assert!(threshold > 0, "threshold must be positive");
-        env.storage().instance().set(&CB_THRESHOLD, &threshold);
+        env.storage()
+            .instance()
+            .set(&keys::CB_THRESHOLD, &threshold);
     }
 
     /// Admin-gated. Resumes processing after a circuit breaker trip has been
@@ -598,9 +588,9 @@ impl RepaymentWaterfall {
     /// default-volume window.
     pub fn resume_processing(env: Env, admin: Symbol) {
         Self::require_admin(&env, &admin);
-        env.storage().instance().set(&CB_ACTIVE, &false);
+        env.storage().instance().set(&keys::CB_ACTIVE, &false);
         env.storage().instance().set(
-            &DEFAULT_RECORD,
+            &keys::DEFAULT_RECORD,
             &DefaultRecord {
                 window_start: env.ledger().timestamp(),
                 volume: 0,
@@ -610,14 +600,17 @@ impl RepaymentWaterfall {
 
     /// Whether the circuit breaker is currently tripped.
     pub fn circuit_breaker_active(env: Env) -> bool {
-        env.storage().instance().get(&CB_ACTIVE).unwrap_or(false)
+        env.storage()
+            .instance()
+            .get(&keys::CB_ACTIVE)
+            .unwrap_or(false)
     }
 
     /// The default volume accumulated in the current rolling 24h window.
     pub fn current_default_volume(env: Env) -> i128 {
         env.storage()
             .instance()
-            .get::<Symbol, DefaultRecord>(&DEFAULT_RECORD)
+            .get::<Symbol, DefaultRecord>(&keys::DEFAULT_RECORD)
             .map(|r| r.volume)
             .unwrap_or(0)
     }
@@ -627,7 +620,11 @@ impl RepaymentWaterfall {
     /// `process_repayment`) so a trip pauses all repayment-waterfall
     /// processing.
     fn require_not_paused(env: &Env) {
-        let active: bool = env.storage().instance().get(&CB_ACTIVE).unwrap_or(false);
+        let active: bool = env
+            .storage()
+            .instance()
+            .get(&keys::CB_ACTIVE)
+            .unwrap_or(false);
         assert!(!active, "circuit breaker active: processing paused");
     }
 
@@ -635,7 +632,7 @@ impl RepaymentWaterfall {
         let admin: Symbol = env
             .storage()
             .instance()
-            .get(&symbol_short!("admin"))
+            .get(&keys::ADMIN)
             .expect("not initialized");
         assert!(*caller == admin, "only admin");
     }
@@ -652,8 +649,6 @@ pub struct QueuedUpgrade {
 }
 
 const UPGRADE_TIMELOCK_SECS: u64 = 48 * 60 * 60;
-const QUEUED_UPGRADE: Symbol = symbol_short!("q_upgrd");
-const UPGRADE_PAUSED: Symbol = symbol_short!("up_pause");
 
 // ── upgrade (proxy upgradability pattern) ───────────────────────────────
 //
@@ -679,7 +674,7 @@ impl RepaymentWaterfall {
 
         let execute_after = env.ledger().timestamp() + UPGRADE_TIMELOCK_SECS;
         env.storage().instance().set(
-            &QUEUED_UPGRADE,
+            &keys::QUEUED_UPGRADE,
             &QueuedUpgrade {
                 new_wasm_hash,
                 execute_after,
@@ -695,7 +690,7 @@ impl RepaymentWaterfall {
         let paused: bool = env
             .storage()
             .instance()
-            .get(&UPGRADE_PAUSED)
+            .get(&keys::UPGRADE_PAUSED)
             .unwrap_or(false);
         if paused {
             return Err(ContractError::UpgradesPaused);
@@ -704,13 +699,13 @@ impl RepaymentWaterfall {
         let queued: QueuedUpgrade = env
             .storage()
             .instance()
-            .get(&QUEUED_UPGRADE)
+            .get(&keys::QUEUED_UPGRADE)
             .ok_or(ContractError::NoQueuedUpgrade)?;
         if env.ledger().timestamp() < queued.execute_after {
             return Err(ContractError::UpgradeTimelockNotElapsed);
         }
 
-        env.storage().instance().remove(&QUEUED_UPGRADE);
+        env.storage().instance().remove(&keys::QUEUED_UPGRADE);
         env.deployer()
             .update_current_contract_wasm(queued.new_wasm_hash);
         Ok(())
@@ -720,10 +715,10 @@ impl RepaymentWaterfall {
     /// admin.
     pub fn cancel_upgrade(env: Env, admin: Symbol) -> Result<(), ContractError> {
         Self::require_upgrade_admin(&env, &admin)?;
-        if !env.storage().instance().has(&QUEUED_UPGRADE) {
+        if !env.storage().instance().has(&keys::QUEUED_UPGRADE) {
             return Err(ContractError::NoQueuedUpgrade);
         }
-        env.storage().instance().remove(&QUEUED_UPGRADE);
+        env.storage().instance().remove(&keys::QUEUED_UPGRADE);
         Ok(())
     }
 
@@ -731,7 +726,7 @@ impl RepaymentWaterfall {
     /// cancelling still work while paused). Requires the stored admin.
     pub fn set_upgrade_paused(env: Env, admin: Symbol, paused: bool) -> Result<(), ContractError> {
         Self::require_upgrade_admin(&env, &admin)?;
-        env.storage().instance().set(&UPGRADE_PAUSED, &paused);
+        env.storage().instance().set(&keys::UPGRADE_PAUSED, &paused);
         Ok(())
     }
 
@@ -743,7 +738,7 @@ impl RepaymentWaterfall {
     ///
     /// Never panics.
     pub fn queued_upgrade(env: Env) -> Option<QueuedUpgrade> {
-        env.storage().instance().get(&QUEUED_UPGRADE)
+        env.storage().instance().get(&keys::QUEUED_UPGRADE)
     }
 
     /// Whether the final Wasm swap is currently held back.
@@ -757,7 +752,7 @@ impl RepaymentWaterfall {
     pub fn is_upgrade_paused(env: Env) -> bool {
         env.storage()
             .instance()
-            .get(&UPGRADE_PAUSED)
+            .get(&keys::UPGRADE_PAUSED)
             .unwrap_or(false)
     }
 
@@ -765,7 +760,7 @@ impl RepaymentWaterfall {
         let admin: Symbol = env
             .storage()
             .instance()
-            .get(&symbol_short!("admin"))
+            .get(&keys::ADMIN)
             .ok_or(ContractError::NotInitialized)?;
         if *caller != admin {
             return Err(ContractError::Unauthorized);

@@ -5,74 +5,7 @@ use soroban_sdk::{
     Symbol, Vec,
 };
 
-/// Persistent storage keys.
-mod storage {
-    use soroban_sdk::{symbol_short, Symbol};
-
-    /// Legacy `Symbol` admin tag. See `ADMIN_ADDR` for the authenticable one.
-    pub const ADMIN: Symbol = symbol_short!("admin");
-    /// Sum of all lender shares outstanding.
-    pub const TOTAL_SHARES: Symbol = symbol_short!("tot_sh");
-    /// Pool capital, in token units: `TOTAL_SHARES * NAV / NAV_SCALE`.
-    pub const TOTAL_CAPITAL: Symbol = symbol_short!("tot_ca");
-    /// Capital currently deployed against financed invoices.
-    pub const FINANCED_AMT: Symbol = symbol_short!("fin_am");
-    /// Utilisation ceiling, in bps, that `FINANCED_AMT` may not exceed.
-    pub const MAX_UTIL: Symbol = symbol_short!("max_ut");
-    /// Net asset value per share, scaled by `NAV_SCALE`.
-    pub const NAV: Symbol = symbol_short!("nav");
-    /// Governance flag: excludes this pool from being picked as a rebalancing donor.
-    pub const DONOR_BLK: Symbol = symbol_short!("dnr_blk");
-    /// Address authorized to queue/cancel timelocked admin actions. Separate
-    /// from the legacy `ADMIN` symbol tag: this is a real `Address` so it can
-    /// be authenticated with `require_auth`.
-    pub const ADMIN_ADDR: Symbol = symbol_short!("adm_addr");
-    /// Next id to assign to a queued timelocked action.
-    pub const NEXT_ACTION: Symbol = symbol_short!("nxt_act");
-
-    // ── Concentration limits (issue #19) ────────────────────────────────
-    /// Per-buyer concentration ceiling, in bps of pool capital.
-    pub const BUYER_CONC_BPS: Symbol = symbol_short!("byr_cnc");
-    /// Per-SME concentration ceiling, in bps of pool capital.
-    pub const SME_CONC_BPS: Symbol = symbol_short!("sme_cnc");
-    /// Marker field for `BuyerExposureKey` — see that type's doc comment for
-    /// why a marker is required.
-    pub const BUYER_EXP_TAG: Symbol = symbol_short!("byr_exp");
-    /// Marker field for `SmeExposureKey` — see that type's doc comment for
-    /// why a marker is required.
-    pub const SME_EXP_TAG: Symbol = symbol_short!("sme_exp");
-
-    // ── Pool creation config (issue #17) ────────────────────────────────
-    /// Whether `create_pool` has already been called (guards duplicate config).
-    pub const POOL_CFG_SET: Symbol = symbol_short!("pl_cfg");
-    /// Buyer exposure limit fixed at pool creation, in bps.
-    pub const BUYER_LIMIT_BPS: Symbol = symbol_short!("buy_lim");
-    /// SME exposure limit fixed at pool creation, in bps.
-    pub const SME_LIMIT_BPS: Symbol = symbol_short!("sme_lim");
-    /// Smallest accepted single deposit.
-    pub const MIN_DEPOSIT: Symbol = symbol_short!("min_dep");
-    /// Largest accepted single deposit.
-    pub const MAX_DEPOSIT: Symbol = symbol_short!("max_dep");
-    /// Share of capital, in bps, kept idle as reserve.
-    pub const RESERVE_RATIO_BPS: Symbol = symbol_short!("rsv_rat");
-
-    // ── Withdrawal lock period (issue #22) ──────────────────────────────
-    /// Seconds a deposit must sit before it can be withdrawn. Defaults to 0
-    /// (no lock) if never configured via `set_lock_period`.
-    pub const LOCK_SECS: Symbol = symbol_short!("lock_sec");
-    /// Withdrawals are blocked once pool utilisation (financed / capital)
-    /// exceeds this bps threshold. Defaults to `BPS_SCALE` (100%, i.e. no
-    /// extra restriction) if never configured.
-    pub const WITHDRAW_UTIL_BPS: Symbol = symbol_short!("wd_util");
-    /// Marker field for `DepositTimeKey` — see that type's doc comment for why.
-    pub const DEP_TS_TAG: Symbol = symbol_short!("dep_ts");
-
-    /// The currently-queued upgrade, if any.
-    pub const QUEUED_UPGRADE: Symbol = symbol_short!("q_upgrd");
-    /// Emergency-pause flag blocking `execute_upgrade` (queueing/cancelling
-    /// still work while paused).
-    pub const UPGRADE_PAUSED: Symbol = symbol_short!("up_pause");
-}
+mod keys;
 
 /// Per-lender last-deposit-timestamp storage key (issue #22).
 ///
@@ -230,23 +163,17 @@ const NAV_SCALE: i128 = 1_000_000;
 impl PoolManager {
     /// One-time initialization with pool parameters.
     pub fn initialize(env: Env, admin: Symbol, max_utilisation: i128) -> Result<(), ContractError> {
-        if env.storage().instance().has(&storage::ADMIN) {
+        if env.storage().instance().has(&keys::ADMIN) {
             return Err(ContractError::AlreadyInitialized);
         }
-        env.storage().instance().set(&storage::ADMIN, &admin);
+        env.storage().instance().set(&keys::ADMIN, &admin);
+        env.storage().instance().set(&keys::TOTAL_SHARES, &0_i128);
+        env.storage().instance().set(&keys::TOTAL_CAPITAL, &0_i128);
+        env.storage().instance().set(&keys::FINANCED_AMT, &0_i128);
         env.storage()
             .instance()
-            .set(&storage::TOTAL_SHARES, &0_i128);
-        env.storage()
-            .instance()
-            .set(&storage::TOTAL_CAPITAL, &0_i128);
-        env.storage()
-            .instance()
-            .set(&storage::FINANCED_AMT, &0_i128);
-        env.storage()
-            .instance()
-            .set(&storage::MAX_UTIL, &max_utilisation);
-        env.storage().instance().set(&storage::NAV, &NAV_SCALE);
+            .set(&keys::MAX_UTIL, &max_utilisation);
+        env.storage().instance().set(&keys::NAV, &NAV_SCALE);
         Ok(())
     }
 
@@ -265,10 +192,10 @@ impl PoolManager {
         max_deposit: i128,
         reserve_ratio_bps: i128,
     ) -> Result<(), ContractError> {
-        if !env.storage().instance().has(&storage::ADMIN) {
+        if !env.storage().instance().has(&keys::ADMIN) {
             return Err(ContractError::PoolNotInitialized);
         }
-        if env.storage().instance().has(&storage::POOL_CFG_SET) {
+        if env.storage().instance().has(&keys::POOL_CFG_SET) {
             return Err(ContractError::PoolAlreadyCreated);
         }
         if buyer_limit_bps <= 0 || buyer_limit_bps > BPS_SCALE {
@@ -284,22 +211,22 @@ impl PoolManager {
             return Err(ContractError::InvalidDepositRange);
         }
 
-        env.storage().instance().set(&storage::POOL_CFG_SET, &true);
+        env.storage().instance().set(&keys::POOL_CFG_SET, &true);
         env.storage()
             .instance()
-            .set(&storage::BUYER_LIMIT_BPS, &buyer_limit_bps);
+            .set(&keys::BUYER_LIMIT_BPS, &buyer_limit_bps);
         env.storage()
             .instance()
-            .set(&storage::SME_LIMIT_BPS, &sme_limit_bps);
+            .set(&keys::SME_LIMIT_BPS, &sme_limit_bps);
         env.storage()
             .instance()
-            .set(&storage::MIN_DEPOSIT, &min_deposit);
+            .set(&keys::MIN_DEPOSIT, &min_deposit);
         env.storage()
             .instance()
-            .set(&storage::MAX_DEPOSIT, &max_deposit);
+            .set(&keys::MAX_DEPOSIT, &max_deposit);
         env.storage()
             .instance()
-            .set(&storage::RESERVE_RATIO_BPS, &reserve_ratio_bps);
+            .set(&keys::RESERVE_RATIO_BPS, &reserve_ratio_bps);
 
         env.events().publish(
             (symbol_short!("pool_new"),),
@@ -325,7 +252,7 @@ impl PoolManager {
     pub fn buyer_limit_bps(env: Env) -> i128 {
         env.storage()
             .instance()
-            .get(&storage::BUYER_LIMIT_BPS)
+            .get(&keys::BUYER_LIMIT_BPS)
             .unwrap_or(0)
     }
 
@@ -338,7 +265,7 @@ impl PoolManager {
     pub fn sme_limit_bps(env: Env) -> i128 {
         env.storage()
             .instance()
-            .get(&storage::SME_LIMIT_BPS)
+            .get(&keys::SME_LIMIT_BPS)
             .unwrap_or(0)
     }
 
@@ -351,7 +278,7 @@ impl PoolManager {
     pub fn min_deposit(env: Env) -> i128 {
         env.storage()
             .instance()
-            .get(&storage::MIN_DEPOSIT)
+            .get(&keys::MIN_DEPOSIT)
             .unwrap_or(0)
     }
 
@@ -365,7 +292,7 @@ impl PoolManager {
     pub fn max_deposit(env: Env) -> i128 {
         env.storage()
             .instance()
-            .get(&storage::MAX_DEPOSIT)
+            .get(&keys::MAX_DEPOSIT)
             .unwrap_or(0)
     }
 
@@ -378,7 +305,7 @@ impl PoolManager {
     pub fn reserve_ratio_bps(env: Env) -> i128 {
         env.storage()
             .instance()
-            .get(&storage::RESERVE_RATIO_BPS)
+            .get(&keys::RESERVE_RATIO_BPS)
             .unwrap_or(0)
     }
 
@@ -395,7 +322,7 @@ impl PoolManager {
         let nav: i128 = env
             .storage()
             .instance()
-            .get(&storage::NAV)
+            .get(&keys::NAV)
             .ok_or(ContractError::NotInitialized)?;
         let shares = amount * NAV_SCALE / nav;
 
@@ -417,21 +344,21 @@ impl PoolManager {
         let tot_shares: i128 = env
             .storage()
             .instance()
-            .get(&storage::TOTAL_SHARES)
+            .get(&keys::TOTAL_SHARES)
             .ok_or(ContractError::NotInitialized)?;
         let new_tot_shares = tot_shares + shares;
 
         env.storage()
             .instance()
-            .set(&storage::TOTAL_SHARES, &new_tot_shares);
+            .set(&keys::TOTAL_SHARES, &new_tot_shares);
         env.storage()
             .instance()
-            .set(&storage::TOTAL_CAPITAL, &(new_tot_shares * nav / NAV_SCALE));
+            .set(&keys::TOTAL_CAPITAL, &(new_tot_shares * nav / NAV_SCALE));
 
         // Record this deposit's timestamp so `withdraw` can enforce the
         // post-deposit lock period (issue #22).
         env.storage().persistent().set(
-            &DepositTimeKey(storage::DEP_TS_TAG, key.0),
+            &DepositTimeKey(keys::DEP_TS_TAG, key.0),
             &env.ledger().timestamp(),
         );
 
@@ -465,7 +392,7 @@ impl PoolManager {
         let nav: i128 = env
             .storage()
             .instance()
-            .get(&storage::NAV)
+            .get(&keys::NAV)
             .ok_or(ContractError::NotInitialized)?;
         let shares = amount * NAV_SCALE / nav;
 
@@ -485,21 +412,21 @@ impl PoolManager {
         let tot_shares: i128 = env
             .storage()
             .instance()
-            .get(&storage::TOTAL_SHARES)
+            .get(&keys::TOTAL_SHARES)
             .ok_or(ContractError::NotInitialized)?;
         let new_tot_shares = tot_shares + shares;
 
         env.storage()
             .instance()
-            .set(&storage::TOTAL_SHARES, &new_tot_shares);
+            .set(&keys::TOTAL_SHARES, &new_tot_shares);
         env.storage()
             .instance()
-            .set(&storage::TOTAL_CAPITAL, &(new_tot_shares * nav / NAV_SCALE));
+            .set(&keys::TOTAL_CAPITAL, &(new_tot_shares * nav / NAV_SCALE));
 
         // Record this deposit's timestamp so `withdraw` can enforce the
         // post-deposit lock period (issue #22).
         env.storage().persistent().set(
-            &DepositTimeKey(storage::DEP_TS_TAG, key.0),
+            &DepositTimeKey(keys::DEP_TS_TAG, key.0),
             &env.ledger().timestamp(),
         );
 
@@ -526,16 +453,12 @@ impl PoolManager {
             return Err(ContractError::InvalidShares);
         }
 
-        let lock_secs: u64 = env
-            .storage()
-            .instance()
-            .get(&storage::LOCK_SECS)
-            .unwrap_or(0);
+        let lock_secs: u64 = env.storage().instance().get(&keys::LOCK_SECS).unwrap_or(0);
         if lock_secs > 0 {
             if let Some(deposited_at) = env
                 .storage()
                 .persistent()
-                .get::<_, u64>(&DepositTimeKey(storage::DEP_TS_TAG, lender.clone()))
+                .get::<_, u64>(&DepositTimeKey(keys::DEP_TS_TAG, lender.clone()))
             {
                 if env.ledger().timestamp() < deposited_at + lock_secs {
                     return Err(ContractError::WithdrawalLocked);
@@ -546,17 +469,17 @@ impl PoolManager {
         let withdraw_util_bps: i128 = env
             .storage()
             .instance()
-            .get(&storage::WITHDRAW_UTIL_BPS)
+            .get(&keys::WITHDRAW_UTIL_BPS)
             .unwrap_or(BPS_SCALE);
         let cap_before: i128 = env
             .storage()
             .instance()
-            .get(&storage::TOTAL_CAPITAL)
+            .get(&keys::TOTAL_CAPITAL)
             .unwrap_or(0);
         let fin_before: i128 = env
             .storage()
             .instance()
-            .get(&storage::FINANCED_AMT)
+            .get(&keys::FINANCED_AMT)
             .unwrap_or(0);
         if cap_before > 0 {
             let current_util_bps = fin_before * BPS_SCALE / cap_before;
@@ -578,7 +501,7 @@ impl PoolManager {
         let nav: i128 = env
             .storage()
             .instance()
-            .get(&storage::NAV)
+            .get(&keys::NAV)
             .ok_or(ContractError::NotInitialized)?;
         let amount = shares * nav / NAV_SCALE;
 
@@ -592,32 +515,32 @@ impl PoolManager {
         let tot_shares: i128 = env
             .storage()
             .instance()
-            .get(&storage::TOTAL_SHARES)
+            .get(&keys::TOTAL_SHARES)
             .ok_or(ContractError::NotInitialized)?;
         let new_tot_shares = tot_shares - shares;
         let new_capital = new_tot_shares * nav / NAV_SCALE;
 
         env.storage()
             .instance()
-            .set(&storage::TOTAL_SHARES, &new_tot_shares);
+            .set(&keys::TOTAL_SHARES, &new_tot_shares);
         env.storage()
             .instance()
-            .set(&storage::TOTAL_CAPITAL, &new_capital);
+            .set(&keys::TOTAL_CAPITAL, &new_capital);
 
         // clamp financed_amount if withdrawal reduced available capacity
         let fin: i128 = env
             .storage()
             .instance()
-            .get(&storage::FINANCED_AMT)
+            .get(&keys::FINANCED_AMT)
             .ok_or(ContractError::NotInitialized)?;
         let max_util: i128 = env
             .storage()
             .instance()
-            .get(&storage::MAX_UTIL)
+            .get(&keys::MAX_UTIL)
             .ok_or(ContractError::NotInitialized)?;
         let limit = new_capital * max_util / 10_000;
         if fin > limit {
-            env.storage().instance().set(&storage::FINANCED_AMT, &limit);
+            env.storage().instance().set(&keys::FINANCED_AMT, &limit);
         }
 
         env.events()
@@ -630,7 +553,7 @@ impl PoolManager {
 
     /// Configures the post-deposit lock period, in seconds.
     pub fn set_lock_period(env: Env, secs: u64) {
-        env.storage().instance().set(&storage::LOCK_SECS, &secs);
+        env.storage().instance().set(&keys::LOCK_SECS, &secs);
     }
 
     /// How long a deposit must sit before it can be withdrawn, in seconds.
@@ -642,10 +565,7 @@ impl PoolManager {
     ///
     /// Never panics.
     pub fn lock_period(env: Env) -> u64 {
-        env.storage()
-            .instance()
-            .get(&storage::LOCK_SECS)
-            .unwrap_or(0)
+        env.storage().instance().get(&keys::LOCK_SECS).unwrap_or(0)
     }
 
     /// Configures the pool-utilisation bps threshold above which withdrawals
@@ -654,9 +574,7 @@ impl PoolManager {
         if bps <= 0 || bps > BPS_SCALE {
             return Err(ContractError::InvalidWithdrawThreshold);
         }
-        env.storage()
-            .instance()
-            .set(&storage::WITHDRAW_UTIL_BPS, &bps);
+        env.storage().instance().set(&keys::WITHDRAW_UTIL_BPS, &bps);
         Ok(())
     }
 
@@ -672,7 +590,7 @@ impl PoolManager {
     pub fn withdraw_util_threshold(env: Env) -> i128 {
         env.storage()
             .instance()
-            .get(&storage::WITHDRAW_UTIL_BPS)
+            .get(&keys::WITHDRAW_UTIL_BPS)
             .unwrap_or(BPS_SCALE)
     }
 
@@ -686,17 +604,17 @@ impl PoolManager {
         let fin: i128 = env
             .storage()
             .instance()
-            .get(&storage::FINANCED_AMT)
+            .get(&keys::FINANCED_AMT)
             .ok_or(ContractError::NotInitialized)?;
         let tot_capital: i128 = env
             .storage()
             .instance()
-            .get(&storage::TOTAL_CAPITAL)
+            .get(&keys::TOTAL_CAPITAL)
             .ok_or(ContractError::NotInitialized)?;
         let max_util: i128 = env
             .storage()
             .instance()
-            .get(&storage::MAX_UTIL)
+            .get(&keys::MAX_UTIL)
             .ok_or(ContractError::NotInitialized)?;
 
         let new_fin = fin + amount;
@@ -704,9 +622,7 @@ impl PoolManager {
             return Err(ContractError::MaxUtilisationExceeded);
         }
 
-        env.storage()
-            .instance()
-            .set(&storage::FINANCED_AMT, &new_fin);
+        env.storage().instance().set(&keys::FINANCED_AMT, &new_fin);
         Ok(())
     }
 
@@ -727,10 +643,10 @@ impl PoolManager {
         }
         env.storage()
             .instance()
-            .set(&storage::BUYER_CONC_BPS, &buyer_limit_bps);
+            .set(&keys::BUYER_CONC_BPS, &buyer_limit_bps);
         env.storage()
             .instance()
-            .set(&storage::SME_CONC_BPS, &sme_limit_bps);
+            .set(&keys::SME_CONC_BPS, &sme_limit_bps);
         Ok(())
     }
 
@@ -746,7 +662,7 @@ impl PoolManager {
     pub fn buyer_exposure(env: Env, buyer: Symbol) -> i128 {
         env.storage()
             .persistent()
-            .get(&BuyerExposureKey(storage::BUYER_EXP_TAG, buyer))
+            .get(&BuyerExposureKey(keys::BUYER_EXP_TAG, buyer))
             .unwrap_or(0)
     }
 
@@ -762,7 +678,7 @@ impl PoolManager {
     pub fn sme_exposure(env: Env, sme: Symbol) -> i128 {
         env.storage()
             .persistent()
-            .get(&SmeExposureKey(storage::SME_EXP_TAG, sme))
+            .get(&SmeExposureKey(keys::SME_EXP_TAG, sme))
             .unwrap_or(0)
     }
 
@@ -790,21 +706,21 @@ impl PoolManager {
         let tot_capital: i128 = env
             .storage()
             .instance()
-            .get(&storage::TOTAL_CAPITAL)
+            .get(&keys::TOTAL_CAPITAL)
             .unwrap_or(0);
         let buyer_limit_bps: i128 = env
             .storage()
             .instance()
-            .get(&storage::BUYER_CONC_BPS)
+            .get(&keys::BUYER_CONC_BPS)
             .unwrap_or(BPS_SCALE);
         let sme_limit_bps: i128 = env
             .storage()
             .instance()
-            .get(&storage::SME_CONC_BPS)
+            .get(&keys::SME_CONC_BPS)
             .unwrap_or(BPS_SCALE);
 
-        let buyer_key = BuyerExposureKey(storage::BUYER_EXP_TAG, buyer.clone());
-        let sme_key = SmeExposureKey(storage::SME_EXP_TAG, sme.clone());
+        let buyer_key = BuyerExposureKey(keys::BUYER_EXP_TAG, buyer.clone());
+        let sme_key = SmeExposureKey(keys::SME_EXP_TAG, sme.clone());
         let buyer_exposure: i128 = env.storage().persistent().get(&buyer_key).unwrap_or(0);
         let sme_exposure: i128 = env.storage().persistent().get(&sme_key).unwrap_or(0);
 
@@ -828,7 +744,7 @@ impl PoolManager {
         let pool_tag: Symbol = env
             .storage()
             .instance()
-            .get(&storage::ADMIN)
+            .get(&keys::ADMIN)
             .unwrap_or_else(|| symbol_short!("pool"));
         let args: Vec<soroban_sdk::Val> = soroban_sdk::vec![
             &env,
@@ -854,29 +770,29 @@ impl PoolManager {
         let tot_shares: i128 = env
             .storage()
             .instance()
-            .get(&storage::TOTAL_SHARES)
+            .get(&keys::TOTAL_SHARES)
             .ok_or(ContractError::NotInitialized)?;
         let max_util: i128 = env
             .storage()
             .instance()
-            .get(&storage::MAX_UTIL)
+            .get(&keys::MAX_UTIL)
             .ok_or(ContractError::NotInitialized)?;
         let new_capital = tot_shares * new_nav / NAV_SCALE;
 
-        env.storage().instance().set(&storage::NAV, &new_nav);
+        env.storage().instance().set(&keys::NAV, &new_nav);
         env.storage()
             .instance()
-            .set(&storage::TOTAL_CAPITAL, &new_capital);
+            .set(&keys::TOTAL_CAPITAL, &new_capital);
 
         // clamp financed_amount if NAV drop reduced available capacity
         let fin: i128 = env
             .storage()
             .instance()
-            .get(&storage::FINANCED_AMT)
+            .get(&keys::FINANCED_AMT)
             .ok_or(ContractError::NotInitialized)?;
         let limit = new_capital * max_util / 10_000;
         if fin > limit {
-            env.storage().instance().set(&storage::FINANCED_AMT, &limit);
+            env.storage().instance().set(&keys::FINANCED_AMT, &limit);
         }
         Ok(())
     }
@@ -893,7 +809,7 @@ impl PoolManager {
     pub fn total_shares(env: Env) -> i128 {
         env.storage()
             .instance()
-            .get(&storage::TOTAL_SHARES)
+            .get(&keys::TOTAL_SHARES)
             .unwrap_or(0)
     }
 
@@ -901,7 +817,7 @@ impl PoolManager {
     pub fn total_capital(env: Env) -> i128 {
         env.storage()
             .instance()
-            .get(&storage::TOTAL_CAPITAL)
+            .get(&keys::TOTAL_CAPITAL)
             .unwrap_or(0)
     }
 
@@ -915,7 +831,7 @@ impl PoolManager {
     pub fn financed_amount(env: Env) -> i128 {
         env.storage()
             .instance()
-            .get(&storage::FINANCED_AMT)
+            .get(&keys::FINANCED_AMT)
             .unwrap_or(0)
     }
 
@@ -926,10 +842,7 @@ impl PoolManager {
     ///
     /// Never panics.
     pub fn max_utilisation(env: Env) -> i128 {
-        env.storage()
-            .instance()
-            .get(&storage::MAX_UTIL)
-            .unwrap_or(0)
+        env.storage().instance().get(&keys::MAX_UTIL).unwrap_or(0)
     }
 
     /// Net asset value per share, scaled by `NAV_SCALE`.
@@ -942,7 +855,7 @@ impl PoolManager {
     pub fn nav(env: Env) -> i128 {
         env.storage()
             .instance()
-            .get(&storage::NAV)
+            .get(&keys::NAV)
             .unwrap_or(NAV_SCALE)
     }
 
@@ -970,19 +883,19 @@ impl PoolManager {
         let cap: i128 = env
             .storage()
             .instance()
-            .get(&storage::TOTAL_CAPITAL)
+            .get(&keys::TOTAL_CAPITAL)
             .unwrap_or(0);
         let fin: i128 = env
             .storage()
             .instance()
-            .get(&storage::FINANCED_AMT)
+            .get(&keys::FINANCED_AMT)
             .unwrap_or(0);
         cap - fin
     }
 
     /// Governance switch: excludes this pool from being picked as a rebalancing donor.
     pub fn set_donor_blocked(env: Env, blocked: bool) {
-        env.storage().instance().set(&storage::DONOR_BLK, &blocked);
+        env.storage().instance().set(&keys::DONOR_BLK, &blocked);
     }
 
     /// Whether this pool is excluded from being picked as a rebalancing donor.
@@ -996,7 +909,7 @@ impl PoolManager {
     pub fn is_donor_blocked(env: Env) -> bool {
         env.storage()
             .instance()
-            .get(&storage::DONOR_BLK)
+            .get(&keys::DONOR_BLK)
             .unwrap_or(false)
     }
 
@@ -1007,12 +920,12 @@ impl PoolManager {
         let tot_shares: i128 = env
             .storage()
             .instance()
-            .get(&storage::TOTAL_SHARES)
+            .get(&keys::TOTAL_SHARES)
             .unwrap_or(0);
         let tot_capital: i128 = env
             .storage()
             .instance()
-            .get(&storage::TOTAL_CAPITAL)
+            .get(&keys::TOTAL_CAPITAL)
             .unwrap_or(0);
         let new_capital = tot_capital + delta;
         if new_capital < 0 {
@@ -1024,25 +937,21 @@ impl PoolManager {
             if new_nav <= 0 {
                 return Err(ContractError::ZeroNav);
             }
-            env.storage().instance().set(&storage::NAV, &new_nav);
+            env.storage().instance().set(&keys::NAV, &new_nav);
         }
         env.storage()
             .instance()
-            .set(&storage::TOTAL_CAPITAL, &new_capital);
+            .set(&keys::TOTAL_CAPITAL, &new_capital);
 
         let fin: i128 = env
             .storage()
             .instance()
-            .get(&storage::FINANCED_AMT)
+            .get(&keys::FINANCED_AMT)
             .unwrap_or(0);
-        let max_util: i128 = env
-            .storage()
-            .instance()
-            .get(&storage::MAX_UTIL)
-            .unwrap_or(0);
+        let max_util: i128 = env.storage().instance().get(&keys::MAX_UTIL).unwrap_or(0);
         let limit = new_capital * max_util / 10_000;
         if fin > limit {
-            env.storage().instance().set(&storage::FINANCED_AMT, &limit);
+            env.storage().instance().set(&keys::FINANCED_AMT, &limit);
         }
         Ok(())
     }
@@ -1065,18 +974,18 @@ impl PoolManager {
         let self_capital: i128 = env
             .storage()
             .instance()
-            .get(&storage::TOTAL_CAPITAL)
+            .get(&keys::TOTAL_CAPITAL)
             .unwrap_or(0);
         let self_fin: i128 = env
             .storage()
             .instance()
-            .get(&storage::FINANCED_AMT)
+            .get(&keys::FINANCED_AMT)
             .unwrap_or(0);
         let self_reserve = self_capital - self_fin;
         let self_blocked: bool = env
             .storage()
             .instance()
-            .get(&storage::DONOR_BLK)
+            .get(&keys::DONOR_BLK)
             .unwrap_or(false);
 
         let mut needy: Option<(Address, i128, i128)> = None; // (addr, reserve, capital)
@@ -1176,10 +1085,10 @@ impl PoolManager {
     /// Additive: independent of the legacy `Symbol` admin tag set in
     /// `initialize`, so it does not change that function's signature.
     pub fn set_timelock_admin(env: Env, admin: Address) -> Result<(), ContractError> {
-        if env.storage().instance().has(&storage::ADMIN_ADDR) {
+        if env.storage().instance().has(&keys::ADMIN_ADDR) {
             return Err(ContractError::TimelockAdminAlreadySet);
         }
-        env.storage().instance().set(&storage::ADMIN_ADDR, &admin);
+        env.storage().instance().set(&keys::ADMIN_ADDR, &admin);
         Ok(())
     }
 
@@ -1196,11 +1105,9 @@ impl PoolManager {
         let id: u32 = env
             .storage()
             .instance()
-            .get(&storage::NEXT_ACTION)
+            .get(&keys::NEXT_ACTION)
             .unwrap_or(0);
-        env.storage()
-            .instance()
-            .set(&storage::NEXT_ACTION, &(id + 1));
+        env.storage().instance().set(&keys::NEXT_ACTION, &(id + 1));
 
         let queued_at = env.ledger().timestamp();
         let execute_after = queued_at + TIMELOCK_SECS;
@@ -1295,14 +1202,14 @@ impl PoolManager {
     ///
     /// Never panics.
     pub fn timelock_admin(env: Env) -> Option<Address> {
-        env.storage().instance().get(&storage::ADMIN_ADDR)
+        env.storage().instance().get(&keys::ADMIN_ADDR)
     }
 
     fn require_timelock_admin(env: &Env) -> Result<Address, ContractError> {
         let admin: Address = env
             .storage()
             .instance()
-            .get(&storage::ADMIN_ADDR)
+            .get(&keys::ADMIN_ADDR)
             .ok_or(ContractError::TimelockAdminNotSet)?;
         admin.require_auth();
         Ok(admin)
@@ -1319,22 +1226,22 @@ impl PoolManager {
     /// max utilisation, re-clamping `financed_amount` if the new ceiling is
     /// now below it (mirroring `set_nav`'s clamp).
     fn apply_parameter(env: &Env, param: &Symbol, new_value: i128) -> Result<(), ContractError> {
-        if *param == storage::MAX_UTIL {
-            env.storage().instance().set(&storage::MAX_UTIL, &new_value);
+        if *param == keys::MAX_UTIL {
+            env.storage().instance().set(&keys::MAX_UTIL, &new_value);
 
             let cap: i128 = env
                 .storage()
                 .instance()
-                .get(&storage::TOTAL_CAPITAL)
+                .get(&keys::TOTAL_CAPITAL)
                 .unwrap_or(0);
             let fin: i128 = env
                 .storage()
                 .instance()
-                .get(&storage::FINANCED_AMT)
+                .get(&keys::FINANCED_AMT)
                 .unwrap_or(0);
             let limit = cap * new_value / BPS_SCALE;
             if fin > limit {
-                env.storage().instance().set(&storage::FINANCED_AMT, &limit);
+                env.storage().instance().set(&keys::FINANCED_AMT, &limit);
             }
             Ok(())
         } else {
@@ -1382,7 +1289,7 @@ impl PoolManager {
 
         let execute_after = env.ledger().timestamp() + TIMELOCK_SECS;
         env.storage().instance().set(
-            &storage::QUEUED_UPGRADE,
+            &keys::QUEUED_UPGRADE,
             &QueuedUpgrade {
                 new_wasm_hash,
                 execute_after,
@@ -1400,7 +1307,7 @@ impl PoolManager {
         let paused: bool = env
             .storage()
             .instance()
-            .get(&storage::UPGRADE_PAUSED)
+            .get(&keys::UPGRADE_PAUSED)
             .unwrap_or(false);
         if paused {
             return Err(ContractError::UpgradesPaused);
@@ -1409,13 +1316,13 @@ impl PoolManager {
         let queued: QueuedUpgrade = env
             .storage()
             .instance()
-            .get(&storage::QUEUED_UPGRADE)
+            .get(&keys::QUEUED_UPGRADE)
             .ok_or(ContractError::NoQueuedUpgrade)?;
         if env.ledger().timestamp() < queued.execute_after {
             return Err(ContractError::TimelockNotElapsed);
         }
 
-        env.storage().instance().remove(&storage::QUEUED_UPGRADE);
+        env.storage().instance().remove(&keys::QUEUED_UPGRADE);
         env.deployer()
             .update_current_contract_wasm(queued.new_wasm_hash);
         Ok(())
@@ -1425,10 +1332,10 @@ impl PoolManager {
     /// admin's authorization.
     pub fn cancel_upgrade(env: Env) -> Result<(), ContractError> {
         Self::require_timelock_admin(&env)?;
-        if !env.storage().instance().has(&storage::QUEUED_UPGRADE) {
+        if !env.storage().instance().has(&keys::QUEUED_UPGRADE) {
             return Err(ContractError::NoQueuedUpgrade);
         }
-        env.storage().instance().remove(&storage::QUEUED_UPGRADE);
+        env.storage().instance().remove(&keys::QUEUED_UPGRADE);
         Ok(())
     }
 
@@ -1437,9 +1344,7 @@ impl PoolManager {
     /// is held back). Requires the timelock admin's authorization.
     pub fn set_upgrade_paused(env: Env, paused: bool) -> Result<(), ContractError> {
         Self::require_timelock_admin(&env)?;
-        env.storage()
-            .instance()
-            .set(&storage::UPGRADE_PAUSED, &paused);
+        env.storage().instance().set(&keys::UPGRADE_PAUSED, &paused);
         Ok(())
     }
 
@@ -1451,7 +1356,7 @@ impl PoolManager {
     ///
     /// Never panics.
     pub fn queued_upgrade(env: Env) -> Option<QueuedUpgrade> {
-        env.storage().instance().get(&storage::QUEUED_UPGRADE)
+        env.storage().instance().get(&keys::QUEUED_UPGRADE)
     }
 
     /// Whether the final Wasm swap is currently held back.
@@ -1466,7 +1371,7 @@ impl PoolManager {
     pub fn is_upgrade_paused(env: Env) -> bool {
         env.storage()
             .instance()
-            .get(&storage::UPGRADE_PAUSED)
+            .get(&keys::UPGRADE_PAUSED)
             .unwrap_or(false)
     }
 }
@@ -2235,7 +2140,7 @@ mod tests {
 
         let id = env.as_contract(&contract_addr, || {
             PoolManager::set_timelock_admin(env.clone(), admin_addr.clone()).unwrap();
-            PoolManager::queue_parameter_change(env.clone(), storage::MAX_UTIL, 9_000).unwrap()
+            PoolManager::queue_parameter_change(env.clone(), keys::MAX_UTIL, 9_000).unwrap()
         });
 
         env.as_contract(&contract_addr, || {
@@ -2263,7 +2168,7 @@ mod tests {
 
         let id = env.as_contract(&contract_addr, || {
             PoolManager::set_timelock_admin(env.clone(), admin_addr).unwrap();
-            PoolManager::queue_parameter_change(env.clone(), storage::MAX_UTIL, 9_000).unwrap()
+            PoolManager::queue_parameter_change(env.clone(), keys::MAX_UTIL, 9_000).unwrap()
         });
 
         advance_time(&env, 47 * 60 * 60);
@@ -2281,7 +2186,7 @@ mod tests {
 
         let id = env.as_contract(&contract_addr, || {
             PoolManager::set_timelock_admin(env.clone(), admin_addr).unwrap();
-            PoolManager::queue_parameter_change(env.clone(), storage::MAX_UTIL, 9_000).unwrap()
+            PoolManager::queue_parameter_change(env.clone(), keys::MAX_UTIL, 9_000).unwrap()
         });
 
         env.as_contract(&contract_addr, || {
@@ -2298,7 +2203,7 @@ mod tests {
 
         let id = env.as_contract(&contract_addr, || {
             PoolManager::set_timelock_admin(env.clone(), admin_addr).unwrap();
-            PoolManager::queue_parameter_change(env.clone(), storage::MAX_UTIL, 9_000).unwrap()
+            PoolManager::queue_parameter_change(env.clone(), keys::MAX_UTIL, 9_000).unwrap()
         });
 
         env.as_contract(&contract_addr, || {
@@ -2326,7 +2231,7 @@ mod tests {
 
         let id = env.as_contract(&contract_addr, || {
             PoolManager::set_timelock_admin(env.clone(), admin_addr).unwrap();
-            PoolManager::queue_parameter_change(env.clone(), storage::MAX_UTIL, 5_000).unwrap()
+            PoolManager::queue_parameter_change(env.clone(), keys::MAX_UTIL, 5_000).unwrap()
         });
 
         advance_time(&env, 48 * 60 * 60);
@@ -2342,7 +2247,7 @@ mod tests {
     fn queue_without_timelock_admin_set_errors() {
         let (env, contract_addr) = setup();
         let err = env.as_contract(&contract_addr, || {
-            PoolManager::queue_parameter_change(env.clone(), storage::MAX_UTIL, 9_000)
+            PoolManager::queue_parameter_change(env.clone(), keys::MAX_UTIL, 9_000)
         });
         assert_eq!(err, Err(ContractError::TimelockAdminNotSet));
     }
